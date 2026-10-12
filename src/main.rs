@@ -40,6 +40,9 @@ pub(crate) struct MyOptions {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Experimental mock-proof Tachyon wallets for private development networks
+    #[cfg(feature = "tachyon")]
+    Tachyon(tachyon_wallet::Command),
     /// Inspect Zcash-related data
     Inspect(commands::inspect::Command),
 
@@ -133,6 +136,8 @@ fn main() -> Result<(), anyhow::Error> {
         };
 
         match cmd {
+            #[cfg(feature = "tachyon")]
+            Command::Tachyon(command) => tokio::task::spawn_blocking(move || command.run()).await?,
             Command::Inspect(command) => command.run().await,
             Command::Wallet(commands::Wallet {
                 wallet_dir,

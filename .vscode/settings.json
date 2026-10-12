@@ -1,0 +1,16 @@
+{
+    "rust-analyzer.cargo.extraEnv": {
+      "ROCKSDB_LIB_DIR": "/opt/homebrew/lib",
+      "CARGO_INCREMENTAL": "0"
+    },
+    "rust-analyzer.runnables.extraEnv": {
+      "ROCKSDB_LIB_DIR": "/opt/homebrew/lib",
+      "CARGO_INCREMENTAL": "0"
+    },
+  
+    "rust-analyzer.cargo.allTargets": false,
+    "rust-analyzer.check.workspace": false,
+  
+    "rust-analyzer.server.path": null
+}
+  

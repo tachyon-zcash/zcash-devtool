@@ -77,6 +77,10 @@ The code developed in this demo resulted in [this](https://github.com/zcash/zcas
 
 ## Documentation
 
+For experimental mock-proof Tachyon wallets connected directly to a private
+Zakura network, see [the Tachyon guide](doc/tachyon.md). This is an optional,
+separate wallet implementation, not an extension of the production wallet DB.
+
 For a step-by-step guide for how to get started using these tools, see [this
 walkthrough](doc/walkthrough.md).
 
