@@ -24,6 +24,16 @@ WALLET="$HOME/tachyon-wallet"
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" address
 ```
 
+## Sync
+
+Sync downloads and validates chain data to update your wallet's note status and balances.
+
+```sh
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --max-blocks 10000
+```
+
+Repeat until `caught_up` is `true`.
+
 ## Receive (Tachyon)
 
 Get funds from the [faucet](https://tachyscan.cnode.phd/faucet) using your `tachyon_address`, and save the downloaded note JSON as `~/Downloads/faucet-note.json`.
@@ -35,7 +45,7 @@ Get funds from the [faucet](https://tachyscan.cnode.phd/faucet) using your `tach
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" balance
 ```
 
-Repeat `sync` until `caught_up` is `true`; the payment must be mined before it becomes available.
+The payment must be mined before it becomes available.
 
 ## Send (Tachyon)
 
