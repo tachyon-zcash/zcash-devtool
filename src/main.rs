@@ -40,6 +40,9 @@ pub(crate) struct MyOptions {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Experimental mock-proof Tachyon wallets for private development networks
+    #[cfg(feature = "tachyon")]
+    Tachyon(tachyon_wallet::Command),
     /// Inspect Zcash-related data
     Inspect(commands::inspect::Command),
 
@@ -122,7 +125,15 @@ fn main() -> Result<(), anyhow::Error> {
         })
         .build()?;
 
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
+        // Tachyon owns its cancellation/progress supervisor; the ordinary
+        // wallet's listener below cannot stop its blocking proof work.
+        #[cfg(feature = "tachyon")]
+        let opts = match opts.command {
+            Some(Command::Tachyon(command)) => return command.run_interruptible().await,
+            command => MyOptions { command },
+        };
+
         #[cfg(feature = "tui")]
         let tui = tui::Tui::new()?.tick_rate(4.0).frame_rate(30.0);
 
@@ -133,6 +144,10 @@ fn main() -> Result<(), anyhow::Error> {
         };
 
         match cmd {
+            #[cfg(feature = "tachyon")]
+            Command::Tachyon(_) => {
+                unreachable!("Tachyon commands were handled before installing the wallet listener")
+            }
             Command::Inspect(command) => command.run().await,
             Command::Wallet(commands::Wallet {
                 wallet_dir,
@@ -257,7 +272,15 @@ fn main() -> Result<(), anyhow::Error> {
 
             Command::CreateMultisigAddress(command) => command.run(),
         }
-    })
+    });
+    #[cfg(feature = "tachyon")]
+    if let Err(error) = &result
+        && let Some(interrupted) = error.downcast_ref::<tachyon_wallet::Interrupted>()
+    {
+        eprintln!("{interrupted}");
+        std::process::exit(interrupted.exit_code);
+    }
+    result
 }
 
 struct ShutdownListener {

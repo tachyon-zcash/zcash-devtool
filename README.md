@@ -1,84 +1,52 @@
-# zcash-devtool
+# zcash-devtool (Tachyon Fork💫)
 
-This repository contains a CLI app for working with Zcash transactions and the
-Zcash blockchain, including stateless Zcash wallet functionality based upon the
-`zcash_client_backend` and `zcash_client_sqlite` crates. It is built by
-developers, for developers for use in prototyping Zcash functionality, and
-should not be considered production-ready. The command-line API that this tool
-exposes can and will change at any time and without warning.
+The Tachyon fork of [zcash-devtool](https://github.com/zcash/zcash-devtool). See the upstream repo for docs and usage info.
 
-## Security Warnings
+Here you will find utilities for interacting with the Tachyon shielded protocol.
 
-**DO NOT USE THIS IN PRODUCTION!!!**
+## Build
 
-This app has not been written with security in mind. It does however have affordances
-such as encryption of the mnemonic seed phrases that should make it viable for small
-scale experimentation, at your own risk.
+`RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo build --release --locked --features tachyon`
 
-## Usage
+the binary will be available in `./target/release/zcash-devtool`
 
-No binary artifacts are provided for this crate; it is generally used via
-`cargo run` as follows:
+Instructions for the Tachyon Alpha Testnet.
 
-To obtain the help docs:
-```
-cargo run --release -- --help
-```
-To obtain the help for a specific command (in this case, `init`)
-```
-cargo run --release -- --help init
+## Init
+
+```sh
+DEVTOOL="$PWD/target/release/zcash-devtool"
+WALLET="$HOME/tachyon-wallet"
+
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" init \
+  --rpc-url http://tachyscan.cnode.phd:18232 \
+  --activation-height 8 --accept-mock-proofs
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" address
 ```
 
-To create a new empty testnet wallet:
-```
-cargo run --release -- wallet -w <wallet_dir> init --name "<account_name>" -i <identity_file> -n test
-cargo run --release -- wallet -w <wallet_dir> sync
+## Receive (Tachyon)
+
+Get funds from the [faucet](https://tachyscan.cnode.phd/faucet) using your `tachyon_address`, and save the downloaded note JSON as `~/Downloads/faucet-note.json`.
+
+```sh
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" receive \
+  --receipt "$HOME/Downloads/faucet-note.json"
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --max-blocks 10000
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" balance
 ```
 
-Note: The `-i` (identity) parameter specifies an age identity file for encrypting the mnemonic phrase. The file will be generated if it doesn't exist.
+Repeat `sync` until `caught_up` is `true`; the payment must be mined before it becomes available.
 
-See the help docs for `init` for additional information, including for how to
-initialize a mainnet wallet. Initializing a mainnet wallet will require
-specifying a mainnet lightwallet server, e.g.
-```
-cargo run --release -- wallet -w <wallet_dir> init --name "<account_name>" -i <identity_file> -n main -s zecrocks
-cargo run --release -- wallet -w <wallet_dir> sync -s zecrocks
-```
+## Send (Tachyon)
 
-To restore an existing wallet from a mnemonic seed phrase, use `restore-mnemonic`:
-```
-cargo run --release -- wallet -w <wallet_dir> restore-mnemonic --name "<account_name>" -i <identity_file> -n test
-cargo run --release -- wallet -w <wallet_dir> sync
-```
-You will be prompted to enter the mnemonic phrase to restore. As with `init`,
-the `-i` (identity) parameter specifies an age identity file used to encrypt the
-mnemonic phrase, and the file will be generated if it doesn't exist. Unless you
-pass `--birthday`, the wallet's birthday defaults to the network's Sapling
-activation height so that the entire history in which it could have received
-funds is scanned.
-
-Whenever you update the `zcash_client_sqlite` dependency, in order to run
-necessary migrations:
-```
-cargo run --release -- wallet -w <wallet_dir> upgrade
+```sh
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" send \
+  --to 'tachyon-test:RECIPIENT_PAYMENT_KEY' --amount-zat 1000000
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" export-receipt \
+  --txid PAYMENT_TXID --out "$HOME/payment.json"
 ```
 
-If you want to run with debug or trace logging:
-```
-RUST_LOG=debug cargo run --release -- wallet -w <wallet_dir> <command>
-```
-### Video tutorial of Zcash Devtool
-Kris Nuttycombe (@nuttycom) presented this tool during ZconVI. The session is available
-on Youtube [here](https://www.youtube.com/watch?v=5gvQF5oFT8E)
-
-[![Youtube preview of the ZconVI presentation Zcash-devtool: the Zcash development multitool](https://img.youtube.com/vi/5gvQF5oFT8E/0.jpg)](https://www.youtube.com/watch?v=5gvQF5oFT8E)
-
-The code developed in this demo resulted in [this](https://github.com/zcash/zcash-devtool/pull/86) pull request.
-
-## Documentation
-
-For a step-by-step guide for how to get started using these tools, see [this
-walkthrough](doc/walkthrough.md).
+Replace `PAYMENT_TXID` with the ID returned by `send`. Share `payment.json` privately with the recipient so they can import it with `receive`.
 
 ## License
 
@@ -88,10 +56,3 @@ All code in this workspace is licensed under either of
  * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
-conditions.

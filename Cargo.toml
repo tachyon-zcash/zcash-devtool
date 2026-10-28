@@ -2,7 +2,7 @@
 name = "zcash-devtool"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -38,6 +38,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = "1"
+tachyon-wallet = { path = "crates/tachyon-wallet", optional = true }
 
 # Zcash
 orchard = { version = "0.15.0", default-features = false }
@@ -114,6 +115,7 @@ tui-logger = { version = "0.18", optional = true, features = ["tracing-support"]
 
 [features]
 default = ["transparent-inputs"]
+tachyon = ["dep:tachyon-wallet"]
 qr = ["dep:qrcode"]
 regtest_support = ["zcash_protocol/local-consensus"]
 pczt-qr = ["dep:image", "dep:minicbor", "dep:nokhwa", "dep:qrcode", "dep:rqrr", "dep:ur"]
@@ -127,3 +129,16 @@ tui = [
     "dep:tokio-util",
     "dep:tui-logger",
 ]
+
+# Match the crypto types used by Zakura's experimental Tachyon transaction crates.
+[patch.crates-io]
+zakura-pasta-curves = { git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7" }
+zakura-reddsa = { git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7" }
+
+[workspace]
+members = ["crates/tachyon-wallet"]
+default-members = ["."]
+resolver = "2"
+
+[dev-dependencies]
+tempfile = "3"

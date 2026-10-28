@@ -1,5 +1,6 @@
 /target
 /zec_sqlite_wallet*
+/wallets
 
 # Guard against accidental commits of the `local` and `tmp` paths
 /local

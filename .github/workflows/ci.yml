@@ -72,3 +72,21 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  tachyon:
+    name: Experimental Tachyon wallet
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: '--cfg zcash_unstable="nutachyon"'
+      RUSTDOCFLAGS: '--cfg zcash_unstable="nutachyon"'
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check devtool integration
+        run: ROCKSDB_LIB_DIR="/opt/homebrew/lib" cargo check --locked --features tachyon
+      - name: Test wallet and proof updates
+        run: ROCKSDB_LIB_DIR="/opt/homebrew/lib" cargo test --locked -p tachyon-wallet
+      - name: Test CLI interrupts and progress output
+        run: ROCKSDB_LIB_DIR="/opt/homebrew/lib" cargo test --locked --features tachyon --test tachyon_cli
+      - name: Lint Tachyon wallet and CLI
+        run: ROCKSDB_LIB_DIR="/opt/homebrew/lib" cargo clippy --locked -p tachyon-wallet -p zcash-devtool --features tachyon --all-targets -- -D warnings
