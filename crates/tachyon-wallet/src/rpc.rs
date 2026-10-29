@@ -8,6 +8,19 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::control::Control;
 
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub code: Option<i64>,
+    method: String,
+    error: Value,
+}
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: Zakura RPC {}", self.method, self.error)
+    }
+}
+impl std::error::Error for RpcError {}
+
 pub struct Rpc {
     client: Client,
     url: Url,
@@ -95,7 +108,12 @@ impl Rpc {
         self.control.check()?;
         let envelope: Value = serde_json::from_slice(&bytes).context("invalid RPC JSON")?;
         if !envelope["error"].is_null() {
-            anyhow::bail!("{method}: Zakura RPC {}", envelope["error"]);
+            return Err(RpcError {
+                code: envelope["error"]["code"].as_i64(),
+                method: method.into(),
+                error: envelope["error"].clone(),
+            }
+            .into());
         }
         ensure!(status.is_success(), "{method}: HTTP {status}");
         ensure!(envelope["id"] == 1, "RPC response ID mismatch");
@@ -116,6 +134,7 @@ impl Rpc {
     pub fn block(&self, height: u32) -> Result<crate::chain::Block> {
         let mut block: crate::chain::Block =
             self.call("gettachyonblock", json!([height.to_string()]))?;
+        ensure!(block.height == height, "gettachyonblock height mismatch");
         let ordinary: Value = self.call("getblock", json!([block.hash, 1]))?;
         ensure!(ordinary["hash"] == block.hash, "getblock identity mismatch");
         block.transactions = serde_json::from_value(ordinary["tx"].clone())?;

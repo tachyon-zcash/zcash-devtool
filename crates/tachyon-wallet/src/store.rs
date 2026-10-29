@@ -22,6 +22,9 @@ pub struct Config {
     pub genesis: String,
     pub network_id: String,
     pub seed: [u8; 32],
+    /// Missing on existing wallets, which retain their activation-based history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday_height: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,7 +130,36 @@ impl Store {
         Ok(config)
     }
     pub fn blocks(&self) -> Result<Vec<Block>> {
-        self.read_all("SELECT data FROM blocks ORDER BY height")
+        let mut blocks: Vec<Block> = self.read_all("SELECT data FROM blocks ORDER BY height")?;
+        // Backfills retain the already downloaded suffix. Until the gap closes,
+        // only the contiguous prefix is usable by balance/proof construction.
+        if let Some(gap) = blocks.windows(2).position(|pair| {
+            pair[0].height.checked_add(1) != Some(pair[1].height)
+                || pair[1].previous_block_hash != pair[0].hash
+                || pair[1].anchor_before != pair[0].anchor_after
+        }) {
+            blocks.truncate(gap + 1);
+        }
+        Ok(blocks)
+    }
+    pub fn block(&self, height: u32) -> Result<Option<Block>> {
+        self.conn
+            .query_row("SELECT data FROM blocks WHERE height=?", [height], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+    pub fn clear_funding_snapshot(&self) -> Result<()> {
+        if self.table_exists("funding_snapshot")? {
+            self.conn.execute("DELETE FROM funding_snapshot", [])?;
+        }
+        Ok(())
+    }
+    pub fn clear_chain(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM blocks", [])?;
+        self.clear_funding_snapshot()
     }
     pub fn notes(&self) -> Result<Vec<Receipt>> {
         self.read_all("SELECT data FROM notes ORDER BY id")
@@ -221,7 +253,7 @@ impl Store {
     }
     pub fn put_block(&self, block: &Block) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO blocks VALUES(?, ?)",
+            "INSERT INTO blocks VALUES(?, ?) ON CONFLICT(height) DO UPDATE SET data=excluded.data",
             params![block.height, serde_json::to_string(block)?],
         )?;
         Ok(())
@@ -244,16 +276,24 @@ impl Store {
                 r.get(0)
             })
             .optional()?;
-        let encoded = serde_json::to_string(receipt)?;
         if let Some(existing) = existing {
+            let mut previous: Receipt = serde_json::from_str(&existing)?;
+            let mut incoming = receipt.clone();
+            let locator = incoming.locator.take().or(previous.locator.take());
+            previous.locator = None;
             ensure!(
-                existing == encoded,
+                previous == incoming,
                 "conflicting receipt for this commitment"
             );
+            incoming.locator = locator;
+            self.conn.execute(
+                "UPDATE notes SET data=? WHERE id=?",
+                params![serde_json::to_string(&incoming)?, receipt.id()?],
+            )?;
         } else {
             self.conn.execute(
                 "INSERT INTO notes VALUES(?, ?)",
-                params![receipt.id()?, encoded],
+                params![receipt.id()?, serde_json::to_string(receipt)?],
             )?;
         }
         Ok(())

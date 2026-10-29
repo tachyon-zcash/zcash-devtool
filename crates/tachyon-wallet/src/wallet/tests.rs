@@ -14,6 +14,8 @@ use std::{
 use transparent::bundle::{Bundle, TxOut};
 use zcash_tachyon::TachyonBundle;
 
+mod sync_cases;
+
 struct NodeData {
     blocks: Vec<Block>,
     raw_funding: String,
@@ -27,6 +29,8 @@ struct NodeData {
     funding_hash_override: Option<String>,
     earlier_blocks: BTreeMap<u32, Value>,
     cancel_request: Option<(String, Option<Value>, Control)>,
+    requests: Vec<(String, Value)>,
+    pruned_heights: BTreeSet<u32>,
 }
 struct Node {
     url: String,
@@ -58,6 +62,8 @@ impl Node {
             funding_hash_override: None,
             earlier_blocks: BTreeMap::new(),
             cancel_request: None,
+            requests: vec![],
+            pruned_heights: BTreeSet::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_data = data.clone();
@@ -94,6 +100,8 @@ impl Node {
                 let request: Value = serde_json::from_slice(&body).unwrap();
                 let mut data = thread_data.lock().unwrap();
                 let params = &request["params"];
+                data.requests
+                    .push((request["method"].as_str().unwrap().into(), params.clone()));
                 let mut error = Value::Null;
                 let result = match request["method"].as_str().unwrap() {
                     "getblockchaininfo" => json!({"chain":"test"}),
@@ -123,8 +131,15 @@ impl Node {
                     }
                     "gettachyonblock" => {
                         let h: u32 = params[0].as_str().unwrap().parse().unwrap();
-                        serde_json::to_value(data.blocks.iter().find(|b| b.height == h).unwrap())
+                        if data.pruned_heights.contains(&h) {
+                            error = json!({"code":-1,"message":"tachygram payload pruned"});
+                            Value::Null
+                        } else {
+                            serde_json::to_value(
+                                data.blocks.iter().find(|b| b.height == h).unwrap(),
+                            )
                             .unwrap()
+                        }
                     }
                     "getblock" => {
                         let id = params[0].as_str().unwrap();
@@ -153,6 +168,27 @@ impl Node {
                             .get(&key)
                             .cloned()
                             .unwrap_or_else(|| json!({"confirmations":100,"coinbase":false}))
+                    }
+                    "getrawtransaction" if params[1] == 1 => {
+                        let txid = params[0].as_str().unwrap();
+                        if let Some(block) = data
+                            .blocks
+                            .iter()
+                            .find(|block| block.transactions.iter().any(|id| id == txid))
+                        {
+                            json!({"txid":txid,"blockhash":block.hash})
+                        } else if data.mempool.iter().any(|raw| {
+                            Transaction::read(&hex::decode(raw).unwrap()[..], BranchId::NuTachyon)
+                                .unwrap()
+                                .txid()
+                                .to_string()
+                                == txid
+                        }) {
+                            json!({"txid":txid})
+                        } else {
+                            error = json!({"code":-5,"message":"Transaction not found in mempool or best chain"});
+                            Value::Null
+                        }
                     }
                     "getrawtransaction" => json!(
                         data.raw_transactions
@@ -646,7 +682,13 @@ fn transparent_send_is_not_blocked_by_a_tachyon_epoch_boundary() -> Result<()> {
     Ok(())
 }
 fn synced_balance(dir: &std::path::Path) -> Result<Value> {
-    command(dir, Operation::Sync { max_blocks: 1000 })?;
+    command(
+        dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
     command(dir, Operation::Balance)
 }
 
@@ -665,6 +707,8 @@ fn init_wallet(node: &Node, dir: &std::path::Path) -> Result<String> {
             activation_height: 8,
             cookie_file: None,
             accept_mock_proofs: true,
+            birthday_height: None,
+            sync_from_activation: false,
         },
     )?;
     Ok(result["funding_address"].as_str().unwrap().into())
@@ -1032,7 +1076,13 @@ fn partial_sync_keeps_canonical_snapshots_and_reorgs_replace_them() -> Result<()
             crate::tests::mine(&mut data.blocks, None)?;
         }
     }
-    let partial = command(&dir, Operation::Sync { max_blocks: 1 })?;
+    let partial = command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1,
+            from_height: None,
+        },
+    )?;
     assert_eq!(partial["height"], 9);
     assert_eq!(partial["caught_up"], false);
     assert!(partial["transparent_synced_height"].is_null());
@@ -1045,7 +1095,13 @@ fn partial_sync_keeps_canonical_snapshots_and_reorgs_replace_them() -> Result<()
             crate::tests::mine(&mut data.blocks, None)?;
         }
     }
-    command(&dir, Operation::Sync { max_blocks: 1 })?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1,
+            from_height: None,
+        },
+    )?;
     let partial = command(&dir, Operation::Balance)?;
     assert_eq!(partial["synced_height"], 11);
     assert_eq!(partial["transparent"]["synced_height"], 10);
@@ -1074,7 +1130,13 @@ fn partial_sync_keeps_canonical_snapshots_and_reorgs_replace_them() -> Result<()
             data.blocks.last_mut().unwrap().hash = hash.repeat(32);
         }
     }
-    command(&dir, Operation::Sync { max_blocks: 1 })?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1,
+            from_height: None,
+        },
+    )?;
     assert!(command(&dir, Operation::Balance)?["transparent"].is_null());
     assert_eq!(synced_balance(&dir)?["transparent"]["total_zat"], 0);
     Ok(())
@@ -1099,7 +1161,10 @@ fn cancelled_sync_rolls_back_blocks_and_funding_snapshot_and_can_resume() -> Res
         wallet_dir: dir.clone(),
         operation_id: None,
         quiet: true,
-        command: Operation::Sync { max_blocks: 1000 },
+        command: Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
     }
     .execute_with_control(&control)
     .unwrap_err();
@@ -1164,7 +1229,14 @@ fn funding_rpc_failures_and_tip_mismatches_roll_back_sync() -> Result<()> {
         crate::tests::mine(&mut data.blocks, None)?;
         data.fail_funding_sync = true;
     }
-    let error = command(&dir, Operation::Sync { max_blocks: 1000 }).unwrap_err();
+    let error = command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("getaddressutxos"));
     assert_eq!(command(&dir, Operation::Balance)?, before);
     {
@@ -1172,7 +1244,14 @@ fn funding_rpc_failures_and_tip_mismatches_roll_back_sync() -> Result<()> {
         data.fail_funding_sync = false;
         data.funding_hash_override = Some("ff".repeat(32));
     }
-    let error = command(&dir, Operation::Sync { max_blocks: 1000 }).unwrap_err();
+    let error = command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -1259,6 +1338,8 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
                 activation_height: 8,
                 cookie_file: None,
                 accept_mock_proofs: true,
+                birthday_height: None,
+                sync_from_activation: false,
             },
         )?;
     }
@@ -1397,12 +1478,31 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
         Operation::ExportReceipt {
             txid: txid.clone(),
             out: receipt_file.clone(),
+            legacy: false,
         },
     )?;
+    let mut exported: Receipt = serde_json::from_slice(&std::fs::read(&receipt_file)?)?;
+    assert_eq!(exported.locator.as_ref().unwrap().txid, txid);
+    assert!(exported.locator.as_ref().unwrap().height.is_none());
+    let legacy_file = temp.path().join("legacy-payment.json");
+    command(
+        &alice,
+        Operation::ExportReceipt {
+            txid: txid.clone(),
+            out: legacy_file.clone(),
+            legacy: true,
+        },
+    )?;
+    let legacy: Value = serde_json::from_slice(&std::fs::read(legacy_file)?)?;
+    assert!(legacy.get("locator").is_none());
+    exported.locator.as_mut().unwrap().txid = txid.to_uppercase();
+    std::fs::write(&receipt_file, serde_json::to_vec(&exported)?)?;
     command(
         &bob,
         Operation::Receive {
             receipt: receipt_file.clone(),
+            txid: None,
+            height: None,
         },
     )?;
     assert_eq!(synced_balance(&bob)?["available_zat"], 0);
@@ -1412,6 +1512,25 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
     node.mine()?;
     assert_eq!(synced_balance(&bob)?["available_zat"], 300_000);
     assert_eq!(synced_balance(&alice)?["available_zat"], 650_000);
+    let mined_file = temp.path().join("mined-payment.json");
+    command(
+        &alice,
+        Operation::ExportReceipt {
+            txid: txid.clone(),
+            out: mined_file.clone(),
+            legacy: false,
+        },
+    )?;
+    let exported: Receipt = serde_json::from_slice(&std::fs::read(mined_file)?)?;
+    let locator = exported.locator.unwrap();
+    assert_eq!(
+        locator.height,
+        Some(node.data.lock().unwrap().blocks.last().unwrap().height)
+    );
+    assert_eq!(
+        locator.block_hash.as_ref(),
+        Some(&node.data.lock().unwrap().blocks.last().unwrap().hash)
+    );
     // Same-height reorg: remove the payment, replace it with an empty block.
     {
         let mut data = node.data.lock().unwrap();
@@ -1495,6 +1614,7 @@ fn reservations_survive_restarts_and_expire_only_after_expiry_height() -> Result
         genesis: hex::encode([0; 32]),
         network_id: crate::tests::NETWORK.into(),
         seed: crate::tests::SEED,
+        birthday_height: None,
     };
     assert_eq!(
         note_states(&store, &config, &blocks, &Control::new(true))?[0].1,

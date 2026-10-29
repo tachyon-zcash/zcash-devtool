@@ -87,6 +87,25 @@ impl Block {
     }
 
     pub fn validate(&self, previous: Option<&Block>, activation: u32) -> Result<()> {
+        self.validate_inner(previous, activation, false)
+    }
+
+    /// Start at an epoch boundary trusted from the configured node. This checks
+    /// the block's transitions, but does not prove the preceding chain history.
+    pub fn validate_checkpoint(&self, activation: u32) -> Result<()> {
+        ensure!(
+            self.pool_height.is_multiple_of(constants::EPOCH_SIZE),
+            "checkpoint must start at an epoch boundary"
+        );
+        self.validate_inner(None, activation, true)
+    }
+
+    fn validate_inner(
+        &self,
+        previous: Option<&Block>,
+        activation: u32,
+        checkpoint: bool,
+    ) -> Result<()> {
         bytes32(&self.hash)?;
         bytes32(&self.previous_block_hash)?;
         ensure!(
@@ -127,8 +146,13 @@ impl Block {
                 );
             }
             None => {
-                ensure!(self.height == activation, "feed must start at activation");
-                ensure!(cursor == Anchor::default(), "incorrect activation anchor");
+                ensure!(
+                    checkpoint || self.height == activation,
+                    "feed must start at activation"
+                );
+                if self.height == activation {
+                    ensure!(cursor == Anchor::default(), "incorrect activation anchor");
+                }
             }
         }
         if self.pool_height.is_multiple_of(constants::EPOCH_SIZE) {

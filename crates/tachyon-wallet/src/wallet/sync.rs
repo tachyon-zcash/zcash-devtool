@@ -1,0 +1,262 @@
+//! Birthday checkpoints and bounded backfills of contiguous public evidence.
+
+use super::*;
+use crate::{note::Locator, rpc::RpcError};
+
+pub(super) fn epoch_start(height: u32, activation: u32) -> Result<u32> {
+    let offset = height
+        .checked_sub(activation)
+        .context("height precedes NuTachyon activation")?;
+    Ok(height - offset % EPOCH_SIZE)
+}
+
+pub(super) fn checkpoint(rpc: &Rpc, height: u32, activation: u32) -> Result<Block> {
+    rpc.control.stage(format!(
+        "Loading trusted epoch checkpoint at height {height}…"
+    ))?;
+    let block = fetch_block(rpc, height)?;
+    block.validate_checkpoint(activation)?;
+    ensure!(
+        rpc.hash(height)? == block.hash,
+        "checkpoint changed during initialization; retry"
+    );
+    Ok(block)
+}
+
+fn fetch_block(rpc: &Rpc, height: u32) -> Result<Block> {
+    rpc.block(height).with_context(|| format!(
+        "cannot obtain Tachyon evidence at height {height}; if it has been pruned, use an archive node (proof-service recovery is not implemented)"
+    ))
+}
+
+/// Hints only narrow the search. Aggregation can put a leaf transaction's
+/// commitment in another transaction's stamp in the same block.
+fn contains_receipt(block: &Block, receipt: &Receipt, locator: &Locator) -> Result<bool> {
+    let cm = receipt.id()?;
+    Ok(block.transactions.contains(&locator.txid)
+        && block
+            .stamps
+            .iter()
+            .any(|stamp| stamp.tachygrams.contains(&cm)))
+}
+
+fn located_block(
+    rpc: &Rpc,
+    height: u32,
+    receipt: &Receipt,
+    locator: &Locator,
+    config: &Config,
+    tip: u32,
+) -> Result<Option<Block>> {
+    if height < config.activation || height > tip {
+        return Ok(None);
+    }
+    // Check the cheap, retained block metadata first. A stale height hint must
+    // not require the payload of an unrelated, potentially pruned block.
+    let hash = rpc.hash(height)?;
+    let header: Value = rpc.call("getblock", json!([hash, 1]))?;
+    ensure!(
+        header["hash"] == hash && header["height"] == height,
+        "receipt block identity mismatch"
+    );
+    let transactions = header["tx"]
+        .as_array()
+        .context("receipt block has no transaction list")?;
+    if !transactions
+        .iter()
+        .any(|id| id.as_str() == Some(locator.txid.as_str()))
+    {
+        return Ok(None);
+    }
+    let block = fetch_block(rpc, height)?;
+    // The subsequent contiguous sync validates the transitions from our
+    // checkpoint. This lookup alone never makes a note spendable.
+    ensure!(
+        hash == block.hash && rpc.hash(height)? == block.hash,
+        "receipt block changed during lookup; retry sync"
+    );
+    Ok(contains_receipt(&block, receipt, locator)?.then_some(block))
+}
+
+pub(super) fn locate(
+    rpc: &Rpc,
+    receipt: &Receipt,
+    config: &Config,
+    tip: u32,
+) -> Result<Option<Block>> {
+    let Some(locator) = &receipt.locator else {
+        return Ok(None);
+    };
+    if let Some(height) = locator.height
+        && let Some(block) = located_block(rpc, height, receipt, locator, config, tip)?
+    {
+        return Ok(Some(block));
+    }
+    // A reorg can move the same transaction to another height. Ignore the
+    // stale hint and resolve the txid against the node's current chain.
+    let result: Value = match rpc.call("getrawtransaction", json!([locator.txid, 1])) {
+        Ok(result) => result,
+        Err(error) if error.downcast_ref::<RpcError>().is_some_and(|error| error.code == Some(-5)) => return Ok(None),
+        Err(error) => return Err(error.context("cannot locate receipt transaction; supply --txid/--height if the node lacks historical transaction lookup")),
+    };
+    let Some(hash) = result["blockhash"].as_str() else {
+        return Ok(None);
+    };
+    bytes32(hash)?;
+    let header: Value = rpc.call("getblock", json!([hash, 1]))?;
+    let height = u32::try_from(
+        header["height"]
+            .as_u64()
+            .context("receipt block has no height")?,
+    )?;
+    if height > tip || height < config.activation || rpc.hash(height)? != hash {
+        return Ok(None); // Mempool, side-chain, or newer than this sync snapshot.
+    }
+    ensure!(header["hash"] == hash, "receipt block identity mismatch");
+    let block = located_block(rpc, height, receipt, locator, config, tip)?;
+    ensure!(
+        block.is_some(),
+        "receipt transaction does not contain the note commitment in its block; correct its locator"
+    );
+    Ok(block)
+}
+
+pub(super) fn progress(height: u32, first: u32, stop: u32, tip: u32) -> String {
+    format!("Fetching block {height} (batch heights {first}–{stop}; node tip {tip})…")
+}
+
+pub(super) fn sync(
+    store: &Store,
+    config: &Config,
+    max_blocks: u32,
+    from_height: Option<u32>,
+    control: &Control,
+) -> Result<Value> {
+    let rpc = rpc(config, control)?;
+    ensure!(
+        rpc.hash(0)? == config.genesis && rpc.hash(config.activation)? == config.activation_hash,
+        "network identity changed (including possible regenesis); use a separate wallet directory"
+    );
+    let funding_address = transaction::funding_address(config.seed)?;
+    let funding = AddressUtxos::fetch(&rpc, &funding_address)?;
+    let tip = funding.height;
+    ensure!(
+        tip >= config.activation,
+        "node tip precedes NuTachyon activation"
+    );
+    control.stage("Loading saved chain inputs…")?;
+    let mut blocks = store.blocks()?;
+    let initial_start = blocks.first().context("wallet has no checkpoint")?.height;
+    let original_last = blocks.last().context("wallet has no checkpoint")?.height;
+    while let Some(last) = blocks.last() {
+        control.check()?;
+        if last.height <= tip && rpc.hash(last.height)? == last.hash {
+            break;
+        }
+        blocks.pop();
+    }
+    if let Some(last) = blocks.last() {
+        if last.height != original_last {
+            store.rewind(last.height)?;
+        }
+    } else {
+        // A checkpoint is pinned to a block, not an eternally trusted height.
+        // Re-bootstrap on the configured node after a reorg crossing it.
+        let height = epoch_start(initial_start.min(tip), config.activation)?;
+        let block = checkpoint(&rpc, height, config.activation)?;
+        store.clear_chain()?;
+        store.put_block(&block)?;
+        blocks.push(block);
+    }
+    let first = blocks
+        .first()
+        .expect("checkpoint was retained or reloaded")
+        .height;
+    let mut needed_start = first;
+    if let Some(height) = from_height {
+        ensure!(height <= tip, "search height is above the node tip");
+        needed_start = needed_start.min(epoch_start(height, config.activation)?);
+    }
+    let known: BTreeSet<_> = blocks
+        .iter()
+        .flat_map(|block| &block.stamps)
+        .flat_map(|stamp| stamp.tachygrams.iter().map(String::as_str))
+        .collect();
+    for mut receipt in store.notes()? {
+        control.check()?;
+        receipt.check_owner(&SpendingKey::from(config.seed), &config.network_id)?;
+        if known.contains(receipt.id()?.as_str()) {
+            continue;
+        }
+        if let Some(block) = locate(&rpc, &receipt, config, tip)? {
+            needed_start = needed_start.min(epoch_start(block.height, config.activation)?);
+            let locator = receipt
+                .locator
+                .as_mut()
+                .expect("located receipts have a locator");
+            locator.height = Some(block.height);
+            locator.block_hash = Some(block.hash);
+            store.put_note(&receipt)?;
+        }
+    }
+    let backfill = needed_start < first;
+    if backfill {
+        let block = checkpoint(&rpc, needed_start, config.activation)?;
+        store.put_block(&block)?;
+        store.clear_funding_snapshot()?;
+        // Keep the cached suffix on disk and reconnect it as the bounded
+        // backfill advances. No wallet notes or reservations are discarded.
+        blocks = vec![block];
+    }
+    let start = blocks.last().expect("sync has a checkpoint").height;
+    let stop = start.saturating_add(max_blocks).min(tip);
+    control.stage(format!(
+        "Syncing heights {}–{stop} (node tip {tip})…",
+        start.saturating_add(1).min(stop)
+    ))?;
+    for height in start.saturating_add(1)..=stop {
+        control.stage(progress(height, start.saturating_add(1), stop, tip))?;
+        let block = if let Some(cached) = store.block(height)? {
+            if rpc.hash(height)? == cached.hash {
+                cached
+            } else {
+                store.rewind(height - 1)?;
+                fetch_block(&rpc, height)?
+            }
+        } else {
+            fetch_block(&rpc, height)?
+        };
+        control.stage(format!("Validating block {height}…"))?;
+        block.validate(blocks.last(), config.activation)?;
+        control.check()?;
+        store.put_block(&block)?;
+        blocks.push(block);
+    }
+    let last = blocks.last().expect("sync has a checkpoint");
+    if last.height == tip {
+        control.stage("Validating transparent funding snapshot…")?;
+        store.put_funding_snapshot(&funding.into_snapshot(&rpc, &funding_address, &blocks)?)?;
+    }
+    ensure!(
+        rpc.hash(last.height)? == last.hash,
+        "chain reorganized during sync; retry"
+    );
+    let known: BTreeSet<_> = blocks
+        .iter()
+        .flat_map(|block| &block.stamps)
+        .flat_map(|stamp| stamp.tachygrams.iter().map(String::as_str))
+        .collect();
+    let mut unresolved = 0;
+    for receipt in store.notes()? {
+        if !known.contains(receipt.id()?.as_str()) {
+            unresolved += 1;
+        }
+    }
+    Ok(
+        json!({"height":last.height,"hash":last.hash,"epoch":last.epoch,"caught_up":last.height == tip,
+        "birthday_height":config.birthday_height.unwrap_or(config.activation),
+        "sync_start_height":blocks.first().expect("sync has a checkpoint").height,
+        "unresolved_receipts":unresolved,
+        "transparent_synced_height":store.funding_snapshot()?.map(|snapshot| snapshot.height)}),
+    )
+}

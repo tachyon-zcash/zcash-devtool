@@ -9,7 +9,7 @@ use zcash_tachyon::{Note, keys::private::SpendingKey, note::CommitmentTrapdoor, 
 
 use crate::chain::bytes32;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub version: u32,
@@ -18,6 +18,29 @@ pub struct Receipt {
     pub value_zat: u64,
     pub psi: String,
     pub rcm: String,
+    /// Public lookup hints, never evidence of confirmation or ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<Locator>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Locator {
+    pub txid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
+}
+
+impl Locator {
+    pub fn validate(&self) -> Result<()> {
+        bytes32(&self.txid)?;
+        if let Some(hash) = &self.block_hash {
+            bytes32(hash)?;
+        }
+        Ok(())
+    }
 }
 
 fn field(encoded: &str) -> Result<Fp> {
@@ -57,6 +80,7 @@ impl Receipt {
             value_zat,
             psi: hex::encode(psi.to_repr()),
             rcm: hex::encode(rcm.to_repr()),
+            locator: None,
         };
         receipt.note()?;
         Ok(receipt)
@@ -64,6 +88,9 @@ impl Receipt {
 
     pub fn note(&self) -> Result<Note> {
         ensure!(self.version == 1, "unsupported receipt version");
+        if let Some(locator) = &self.locator {
+            locator.validate()?;
+        }
         ensure!(
             self.value_zat > 0,
             "zero-value notes are not supported by this wallet"

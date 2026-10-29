@@ -4,7 +4,7 @@ use crate::{
     chain::{Block, bytes32},
     control::{self, Control},
     funding_balance::{AddressUtxos, COINBASE_MATURITY},
-    note::{self, Receipt},
+    note::{self, Locator, Receipt},
     rpc::Rpc,
     store::{Config, Pending, Store, StoredOperation, write_private},
     transaction::{self, FEE, Funding, Payment},
@@ -23,6 +23,9 @@ use std::{
     path::PathBuf,
 };
 use zcash_tachyon::{EpochIndex, constants::EPOCH_SIZE, keys::private::SpendingKey};
+
+mod sync;
+use sync::sync;
 
 #[derive(Debug, Args)]
 pub struct Command {
@@ -52,6 +55,12 @@ enum Operation {
         /// Required acknowledgement: test funds only; neither proofs nor storage are production-safe.
         #[arg(long)]
         accept_mock_proofs: bool,
+        /// Earliest relevant height; defaults to the node tip for a new wallet.
+        #[arg(long, conflicts_with = "sync_from_activation")]
+        birthday_height: Option<u32>,
+        /// Replay from NuTachyon activation instead of trusting a recent epoch checkpoint.
+        #[arg(long)]
+        sync_from_activation: bool,
     },
     /// Print Tachyon payment and transparent funding addresses.
     Address,
@@ -61,11 +70,20 @@ enum Operation {
     Sync {
         #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10000))]
         max_blocks: u32,
+        /// Extend history to this height's epoch, for older/legacy note receipts.
+        #[arg(long)]
+        from_height: Option<u32>,
     },
     /// Import a confidential payment receipt received out of band.
     Receive {
         #[arg(long)]
         receipt: PathBuf,
+        /// Supply or correct the originating transaction ID in a legacy receipt.
+        #[arg(long)]
+        txid: Option<String>,
+        /// Optional mined-height hint; verified against the canonical chain.
+        #[arg(long)]
+        height: Option<u32>,
     },
     /// Shield an amount in zatoshis, or an entire explicit output less the fee.
     Shield {
@@ -109,6 +127,9 @@ enum Operation {
         txid: String,
         #[arg(long)]
         out: PathBuf,
+        /// Omit location metadata for older receivers that reject extra JSON fields.
+        #[arg(long)]
+        legacy: bool,
     },
     /// Retry broadcasting the exact stored transaction, without creating a replacement.
     Submit {
@@ -163,6 +184,8 @@ impl Command {
             activation_height,
             cookie_file,
             accept_mock_proofs,
+            birthday_height,
+            sync_from_activation,
         } = self.command
         {
             ensure!(
@@ -180,33 +203,47 @@ impl Command {
                 "only test/regtest networks are supported"
             );
             let genesis = rpc.hash(0)?;
-            let block = rpc
-                .block(activation_height)
-                .context("node must have activated NuTachyon and expose gettachyonblock")?;
-            block.validate(None, activation_height)?;
+            let tip = rpc.height()?;
+            ensure!(tip >= activation_height, "node has not activated NuTachyon");
+            let activation_hash = rpc.hash(activation_height)?;
+            let birthday_height = if sync_from_activation {
+                activation_height
+            } else {
+                birthday_height.unwrap_or(tip)
+            };
+            ensure!(
+                birthday_height <= tip,
+                "wallet birthday is above the node tip"
+            );
+            let start = sync::epoch_start(birthday_height, activation_height)?;
+            let checkpoint = sync::checkpoint(&rpc, start, activation_height)?;
             let identity = Sha256::new()
                 .chain_update(bytes32(&genesis)?)
                 .chain_update(activation_height.to_le_bytes())
-                .chain_update(bytes32(&block.hash)?)
+                .chain_update(bytes32(&activation_hash)?)
                 .finalize();
             let config = Config {
                 version: 1,
                 rpc_url,
                 cookie_file,
                 activation: activation_height,
-                activation_hash: block.hash.clone(),
+                activation_hash,
                 genesis,
                 network_id: hex::encode(identity),
                 seed: note::random_seed(),
+                birthday_height: Some(birthday_height),
             };
             // Finish this short initialization transaction once started, rather
             // than leaving a newly-created wallet without its configuration.
             control.stage("Initializing wallet database…")?;
             let store = Store::open(&self.wallet_dir, true)?;
             store.set_config(&config)?;
-            store.put_block(&block)?;
+            store.put_block(&checkpoint)?;
             store.commit()?;
-            return addresses(&config);
+            let mut result = addresses(&config)?;
+            result["sync_start_height"] = json!(start);
+            result["trusted_checkpoint"] = json!(start != activation_height);
+            return Ok(result);
         }
         control.stage("Opening wallet database…")?;
         let store = Store::open(&self.wallet_dir, false)?;
@@ -246,23 +283,67 @@ impl Command {
                     "transparent":transparent,
                     "notes":states.into_iter().map(|(r,s)| Ok(json!({"id":r.id()?,"value_zat":r.value_zat,"status":s}))).collect::<Result<Vec<_>>>()?})
             }
-            Operation::Sync { max_blocks } => sync(&store, &config, max_blocks, control)?,
-            Operation::Receive { receipt } => {
+            Operation::Sync {
+                max_blocks,
+                from_height,
+            } => sync(&store, &config, max_blocks, from_height, control)?,
+            Operation::Receive {
+                receipt,
+                txid,
+                height,
+            } => {
                 let mut data = Vec::new();
                 std::fs::File::open(receipt)?
                     .take(16_385)
                     .read_to_end(&mut data)?;
                 ensure!(data.len() <= 16_384, "receipt exceeds 16 KiB");
-                let receipt: Receipt = serde_json::from_slice(&data)?;
+                let mut receipt: Receipt = serde_json::from_slice(&data)?;
+                if let Some(txid) = txid {
+                    receipt.locator = Some(Locator {
+                        txid: hex::encode(bytes32(&txid)?),
+                        height,
+                        block_hash: None,
+                    });
+                } else if let Some(height) = height {
+                    let locator = receipt
+                        .locator
+                        .as_mut()
+                        .context("--height needs a receipt locator or --txid")?;
+                    locator.height = Some(height);
+                    locator.block_hash = None;
+                }
+                if let Some(locator) = receipt.locator.as_mut() {
+                    locator.txid = hex::encode(bytes32(&locator.txid)?);
+                    locator.block_hash = locator
+                        .block_hash
+                        .as_deref()
+                        .map(|hash| bytes32(hash).map(hex::encode))
+                        .transpose()?;
+                }
                 receipt.check_owner(&key, &config.network_id)?;
                 store.put_note(&receipt)?;
-                json!({"note_id":receipt.id()?, "status":"imported; sync to confirm"})
+                json!({"note_id":receipt.id()?, "status":"imported; sync to confirm",
+                    "locator":receipt.locator,
+                    "hint":if receipt.locator.is_none() { Some("Legacy receipt: supply --txid/--height, or sync --from-height for notes older than the downloaded history") } else { None }})
             }
-            Operation::ExportReceipt { txid, out } => {
+            Operation::ExportReceipt { txid, out, legacy } => {
                 let pending = find_pending(&store, &txid)?;
-                let receipt = pending
+                let mut receipt = pending
                     .receipt
                     .context("this transaction has no recipient receipt")?;
+                receipt.locator = if legacy {
+                    None
+                } else {
+                    let blocks = store.blocks()?;
+                    let block = blocks
+                        .iter()
+                        .find(|block| block.transactions.contains(&txid));
+                    Some(Locator {
+                        txid: hex::encode(bytes32(&txid)?),
+                        height: block.map(|block| block.height),
+                        block_hash: block.map(|block| block.hash.clone()),
+                    })
+                };
                 write_private(&out, &serde_json::to_vec_pretty(&receipt)?)?;
                 json!({"txid":txid,"receipt":out})
             }
@@ -280,7 +361,7 @@ impl Command {
             }
             Operation::Submit { txid } => {
                 ensure!(
-                    sync(&store, &config, 1000, control)?["caught_up"] == true,
+                    sync(&store, &config, 1000, None, control)?["caught_up"] == true,
                     "run sync until caught up before submitting"
                 );
                 let pending = find_pending(&store, &txid)?;
@@ -323,67 +404,8 @@ fn rpc(config: &Config, control: &Control) -> Result<Rpc> {
 }
 fn addresses(config: &Config) -> Result<Value> {
     Ok(
-        json!({"network_id":config.network_id,"tachyon_address":note::address(&SpendingKey::from(config.seed)),
+        json!({"network_id":config.network_id,"birthday_height":config.birthday_height.unwrap_or(config.activation),"tachyon_address":note::address(&SpendingKey::from(config.seed)),
         "funding_address":transaction::funding_address(config.seed)?,"warning":"mock proofs; unencrypted keys; test funds only"}),
-    )
-}
-
-fn sync(store: &Store, config: &Config, max_blocks: u32, control: &Control) -> Result<Value> {
-    let rpc = rpc(config, control)?;
-    ensure!(
-        rpc.hash(0)? == config.genesis && rpc.hash(config.activation)? == config.activation_hash,
-        "network identity changed (including possible regenesis); use a separate wallet directory"
-    );
-    let funding_address = transaction::funding_address(config.seed)?;
-    // The UTXO index and Tachyon feed must describe the same chain tip, even if
-    // mining continues while we download. Partial syncs retain their older snapshot.
-    let funding = AddressUtxos::fetch(&rpc, &funding_address)?;
-    let tip = funding.height;
-    control.stage("Loading saved chain inputs…")?;
-    let mut blocks = store.blocks()?;
-    while let Some(last) = blocks.last() {
-        control.check()?;
-        if last.height <= tip && rpc.hash(last.height)? == last.hash {
-            break;
-        }
-        blocks.pop();
-    }
-    let last = blocks
-        .last()
-        .context("activation block changed; reinitialize on the intended network")?;
-    store.rewind(last.height)?;
-    let stop = last.height.saturating_add(max_blocks).min(tip);
-    let start = last.height;
-    control.stage(format!(
-        "Syncing {} blocks: height {start} → {stop} (node tip {tip})…",
-        stop - start
-    ))?;
-    for height in last.height.saturating_add(1)..=stop {
-        control.stage(format!(
-            "Fetching block {height} ({}/{})…",
-            height - start,
-            stop - start
-        ))?;
-        let block = rpc.block(height)?;
-        control.stage(format!("Validating block {height}…"))?;
-        block.validate(blocks.last(), config.activation)?;
-        control.check()?;
-        store.put_block(&block)?;
-        blocks.push(block);
-    }
-    let last = blocks.last().context("activation block exists")?;
-    if last.height == tip {
-        control.stage("Validating transparent funding snapshot…")?;
-        let snapshot = funding.into_snapshot(&rpc, &funding_address, &blocks)?;
-        store.put_funding_snapshot(&snapshot)?;
-    }
-    ensure!(
-        rpc.hash(last.height)? == last.hash,
-        "chain reorganized during sync; retry"
-    );
-    Ok(
-        json!({"height":last.height,"hash":last.hash,"epoch":last.epoch,"caught_up":last.height == tip,
-            "transparent_synced_height":store.funding_snapshot()?.map(|snapshot| snapshot.height)}),
     )
 }
 
@@ -556,7 +578,7 @@ fn pay(
         return Ok(result); // Offline: never reselect inputs, rebuild proofs, or rebroadcast.
     }
     ensure!(
-        sync(store, config, 1000, control)?["caught_up"] == true,
+        sync(store, config, 1000, None, control)?["caught_up"] == true,
         "run sync until caught up before creating transactions"
     );
     let blocks = store.blocks()?;
@@ -711,11 +733,20 @@ fn pay(
         "chain changed or transaction expired during proving; sync and retry"
     );
     let txid = tx.txid().to_string();
+    let locator = Locator {
+        txid: txid.clone(),
+        height: None,
+        block_hash: None,
+    };
+    if let Some(receipt) = recipient.as_mut() {
+        receipt.locator = Some(locator.clone());
+    }
     let mut raw = Vec::new();
     tx.write(&mut raw)?;
-    for output in &outputs {
+    for mut output in outputs {
         if output.payment_key == note::payment_key(&SpendingKey::from(config.seed)) {
-            store.put_note(output)?;
+            output.locator = Some(locator.clone());
+            store.put_note(&output)?;
         }
     }
     let pending = Pending {

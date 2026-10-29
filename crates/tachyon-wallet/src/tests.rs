@@ -328,6 +328,37 @@ fn old_note_spends_after_populated_and_empty_closed_epochs() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn checkpoint_history_supports_spends_before_and_after_creation_epoch_closes() -> Result<()> {
+    let mut blocks = vec![genesis()];
+    while blocks.last().unwrap().epoch < 1 {
+        mine(&mut blocks, None)?;
+    }
+    let checkpoint = blocks.last().unwrap().clone();
+    checkpoint.validate_checkpoint(8)?;
+    assert!(checkpoint.validate(None, 8).is_err());
+    blocks = vec![checkpoint]; // No public data from epoch zero is needed.
+    let receipt = own(1_000_000);
+    let tx = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&tx))?;
+    for target_epoch in [1, 2] {
+        while blocks.last().unwrap().epoch < target_epoch {
+            mine(&mut blocks, None)?;
+        }
+        let sent = build(Payment {
+            seed: SEED,
+            blocks: &blocks,
+            spend: Some(&receipt),
+            funding: None,
+            outputs: &[own(950_000)],
+            transparent_output: None,
+            expiry: blocks.last().unwrap().height + 20,
+        })?;
+        transaction::verify_for_test(&sent, None)?;
+    }
+    Ok(())
+}
+
 /// Add distinct public stamp inputs without generating thousands of payments.
 /// Each stamp fits individually; their union deliberately exceeds one polynomial.
 fn populate_epoch(blocks: &mut Vec<Block>, count: usize) -> Result<()> {

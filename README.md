@@ -24,6 +24,8 @@ WALLET="$HOME/tachyon-wallet"
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" address
 ```
 
+New wallets use the current tip as their birthday and trust the configured node's checkpoint at the start of that epoch. Use `--birthday-height HEIGHT` for an older birthday, or `--sync-from-activation` to replay from height 8. Existing wallets keep their history.
+
 ## Sync
 
 Sync downloads and validates chain data to update your wallet's note status and balances.
@@ -33,6 +35,8 @@ Sync downloads and validates chain data to update your wallet's note status and 
 ```
 
 Repeat until `caught_up` is `true`.
+
+Importing an older receipt automatically extends the scan to its creation epoch. For a legacy receipt without a transaction ID, use `sync --from-height HEIGHT --max-blocks 10000` to search from a known height (or 8 if unknown). Pruned history requires an archive node; proof-service recovery is not yet supported.
 
 ## Receive (Tachyon)
 
@@ -47,6 +51,8 @@ Get funds from the [faucet](https://tachyscan.cnode.phd/faucet) using your `tach
 
 The payment must be mined before it becomes available.
 
+New receipts include a transaction locator. For an older receipt, add `--txid PAYMENT_TXID` to `receive`; optionally add `--height HEIGHT`. These are verified lookup hints. `unresolved_receipts` in sync output counts notes not yet found in downloaded history, including pending payments.
+
 ## Send (Tachyon)
 
 ```sh
@@ -57,6 +63,8 @@ The payment must be mined before it becomes available.
 ```
 
 Replace `PAYMENT_TXID` with the ID returned by `send`. Share `payment.json` privately with the recipient so they can import it with `receive`.
+
+Exports include the transaction ID, plus its block height and hash when known to the wallet. Add `--legacy` for older receivers that reject location metadata.
 
 ## License
 
