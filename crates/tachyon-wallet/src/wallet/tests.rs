@@ -1,7 +1,9 @@
 use super::*;
+use crate::chain::Block;
 use primitives::transaction::{Authorized, TransactionData};
 use protocol::{consensus::BlockHeight, value::Zatoshis};
 use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader, Write},
     net::TcpListener,
     sync::{
@@ -298,6 +300,7 @@ fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) 
     Command {
         wallet_dir: dir.into(),
         operation_id: id.map(str::to_owned),
+        expected_tip: None,
         quiet: true,
         command,
     }
@@ -309,6 +312,227 @@ fn transparent_send(to: &str, amount_zat: u64) -> Operation {
         to: to.into(),
         amount_zat,
     }
+}
+
+#[test]
+fn consolidate_combines_multiple_notes_into_one() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    install_funding(&node, &address, &[200_000, 300_000])?;
+    for _ in 0..2 {
+        command(
+            &dir,
+            Operation::Shield {
+                amount_zat: Some(100_000),
+                txid: None,
+                index: None,
+            },
+        )?;
+        node.mine()?;
+    }
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    assert_eq!(
+        command(&dir, Operation::BalanceSummary)?["notes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    command(&dir, Operation::Consolidate { max_inputs: 16 })?;
+    node.mine()?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    let balance = command(&dir, Operation::BalanceSummary)?;
+    assert_eq!(balance["available_zat"], 150_000);
+    assert_eq!(balance["notes"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn send_combines_notes_when_no_single_note_is_sufficient() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let funding_address = init_wallet(&node, &dir)?;
+    install_funding(&node, &funding_address, &[200_000, 300_000])?;
+    for _ in 0..2 {
+        command(
+            &dir,
+            Operation::Shield {
+                amount_zat: Some(100_000),
+                txid: None,
+                index: None,
+            },
+        )?;
+        node.mine()?;
+    }
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    let own = command(&dir, Operation::Address)?["tachyon_address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    command(
+        &dir,
+        Operation::Send {
+            to: own,
+            amount_zat: 150_000,
+        },
+    )?;
+    assert_eq!(
+        command(&dir, Operation::BalanceSummary)?["available_zat"],
+        0
+    );
+    node.mine()?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    let balance = command(&dir, Operation::BalanceSummary)?;
+    assert_eq!(balance["available_zat"], 150_000, "{balance}");
+    Ok(())
+}
+
+#[test]
+fn balance_summary_allows_unconfirmed_notes_without_nullifiers() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    install_funding(&node, &address, &[150_000])?;
+    command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(100_000),
+            txid: None,
+            index: None,
+        },
+    )?;
+    let result = command(&dir, Operation::BalanceSummary)?;
+    assert_eq!(result["available_zat"], 0);
+    assert!(result["notes"].as_array().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn balance_summary_exposes_validated_funding_candidates() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding = install_funding(&node, &address, &[100_000, 200_000])?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    let result = command(&dir, Operation::BalanceSummary)?;
+    let candidates = result["transparent"]["funding_candidates"]
+        .as_array()
+        .context("funding candidates must be an array")?;
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0]["satoshis"], 100_000);
+    assert_eq!(candidates[1]["satoshis"], 200_000);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate["coinbase"] == false)
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| { candidate["txid"] == funding.txid().to_string() })
+    );
+    Ok(())
+}
+
+#[test]
+fn expected_tip_skips_redundant_sync_and_rejects_stale_tip() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    install_funding(&node, &address, &[150_000])?;
+    command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(100_000),
+            txid: None,
+            index: None,
+        },
+    )?;
+    node.mine()?;
+    let synced = command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    let tip = synced["hash"].as_str().unwrap().to_string();
+    node.data.lock().unwrap().requests.clear();
+    let result = Command {
+        wallet_dir: dir.clone(),
+        operation_id: None,
+        expected_tip: Some(tip.clone()),
+        quiet: true,
+        command: Operation::Send {
+            to: note::address(&SpendingKey::from([9; 32])),
+            amount_zat: 50_000,
+        },
+    }
+    .execute()?;
+    assert_eq!(result["status"], "submitted");
+    let requests = node.data.lock().unwrap().requests.clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|(method, _)| method == "getaddressutxos")
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|(method, _)| method == "gettachyonblock")
+    );
+
+    node.data.lock().unwrap().requests.clear();
+    let error = Command {
+        wallet_dir: dir,
+        operation_id: None,
+        expected_tip: Some(hex::encode([0; 32])),
+        quiet: true,
+        command: Operation::Send {
+            to: note::address(&SpendingKey::from([9; 32])),
+            amount_zat: 50_000,
+        },
+    }
+    .execute()
+    .unwrap_err();
+    assert!(error.to_string().contains("does not match expected tip"));
+    Ok(())
 }
 
 #[test]
@@ -432,6 +656,21 @@ fn operation_id_recovers_ambiguous_broadcast_and_replays_without_network() -> Re
         command(&dir, Operation::Transactions)?["transactions"][0]["operation_id"],
         "job:1"
     );
+    let selected = command(
+        &dir,
+        Operation::TransactionStatus {
+            ids: vec!["job:1".into()],
+        },
+    )?;
+    assert_eq!(selected["transactions"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["transactions"][0]["operation_id"], "job:1");
+    let unknown = command(
+        &dir,
+        Operation::TransactionStatus {
+            ids: vec!["job:missing".into()],
+        },
+    )?;
+    assert!(unknown["transactions"].as_array().unwrap().is_empty());
     Ok(())
 }
 
@@ -896,6 +1135,39 @@ fn automatic_shield_selects_smallest_eligible_output_and_returns_transparent_cha
 }
 
 #[test]
+fn automatic_shield_absorbs_dust_change_into_fee() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding = install_funding(&node, &address, &[150_005])?;
+    node.data.lock().unwrap().fail_submission = true;
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(100_000),
+            txid: None,
+            index: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("broadcast outcome may be ambiguous"),
+        "{error:#}"
+    );
+    let tx = Transaction::read(
+        &hex::decode(&node.data.lock().unwrap().mempool[0])?[..],
+        BranchId::NuTachyon,
+    )?;
+    assert!(tx.transparent_bundle().unwrap().vout.is_empty());
+    transaction::verify_for_test(
+        &tx,
+        Some(funding.transparent_bundle().unwrap().vout[0].clone()),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn explicit_shield_amount_overrides_selection_and_legacy_sweeps_the_output() -> Result<()> {
     for (amount, index, expected_note, expected_change) in [
         (Some(100_000), 0, 100_000, Some(350_000)),
@@ -1059,6 +1331,10 @@ fn existing_wallet_upgrades_on_sync_and_balance_stays_offline() -> Result<()> {
     assert_eq!(balance["transparent"]["address"], address);
     drop(node);
     assert_eq!(command(&dir, Operation::Balance)?, balance);
+    let summary = command(&dir, Operation::BalanceSummary)?;
+    assert_eq!(summary["notes"], serde_json::json!([]));
+    assert_eq!(summary["available_zat"], balance["available_zat"]);
+    assert_eq!(summary["transparent"], balance["transparent"]);
     Ok(())
 }
 
@@ -1160,6 +1436,7 @@ fn cancelled_sync_rolls_back_blocks_and_funding_snapshot_and_can_resume() -> Res
     let error = Command {
         wallet_dir: dir.clone(),
         operation_id: None,
+        expected_tip: None,
         quiet: true,
         command: Operation::Sync {
             max_blocks: 1000,
@@ -1188,6 +1465,7 @@ fn cancelled_broadcast_retains_signed_payment_and_reservation() -> Result<()> {
     let error = Command {
         wallet_dir: dir.clone(),
         operation_id: Some("cancelled-payment".into()),
+        expected_tip: None,
         quiet: true,
         command: transparent_send(&address, 100_000),
     }
@@ -1617,17 +1895,19 @@ fn reservations_survive_restarts_and_expire_only_after_expiry_height() -> Result
         birthday_height: None,
     };
     assert_eq!(
-        note_states(&store, &config, &blocks, &Control::new(true))?[0].1,
+        note_states(&store, &config, &Control::new(true), true)?[0].1,
         "reserved"
     );
     crate::tests::mine(&mut blocks, None)?;
+    store.put_block(blocks.last().unwrap())?;
     assert_eq!(
-        note_states(&store, &config, &blocks, &Control::new(true))?[0].1,
+        note_states(&store, &config, &Control::new(true), true)?[0].1,
         "reserved"
     );
     crate::tests::mine(&mut blocks, None)?;
+    store.put_block(blocks.last().unwrap())?;
     assert_eq!(
-        note_states(&store, &config, &blocks, &Control::new(true))?[0].1,
+        note_states(&store, &config, &Control::new(true), true)?[0].1,
         "available"
     );
     Ok(())

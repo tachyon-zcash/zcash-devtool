@@ -1,7 +1,7 @@
 //! Scriptable, single-note development wallet commands. No background scheduler.
 
 use crate::{
-    chain::{Block, bytes32},
+    chain::bytes32,
     control::{self, Control},
     funding_balance::{AddressUtxos, COINBASE_MATURITY},
     note::{self, Locator, Receipt},
@@ -11,17 +11,13 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
-use ff::PrimeField;
-use pasta_curves::Fp;
 use primitives::transaction::Transaction;
 use protocol::consensus::BranchId;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-    path::PathBuf,
-};
+use std::{collections::BTreeSet, io::Read, path::PathBuf};
+use udon::field::Field;
+use zcash_tachyon::pasta::Fp;
 use zcash_tachyon::{EpochIndex, constants::EPOCH_SIZE, keys::private::SpendingKey};
 
 mod sync;
@@ -32,9 +28,12 @@ pub struct Command {
     /// Separate, private directory for this experimental wallet (not the ordinary wallet DB).
     #[arg(long, value_hint = clap::ValueHint::DirPath)]
     wallet_dir: PathBuf,
-    /// Optional wallet-local idempotency key for shield/send/unshield/transparent-send.
+    /// Optional idempotency key for shield/send/unshield/transparent-send.
     #[arg(long, global = true)]
     operation_id: Option<String>,
+    /// Build a payment against an already-synced tip, without resyncing.
+    #[arg(long, global = true)]
+    expected_tip: Option<String>,
     /// Suppress progress on stderr (errors and interruption notices remain visible).
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
@@ -66,6 +65,8 @@ enum Operation {
     Address,
     /// Show Tachyon notes and confirmed transparent funding from the last successful sync, offline.
     Balance,
+    /// Show only aggregate balances, without serializing historical notes.
+    BalanceSummary,
     /// Validate and persist chain inputs; repeat until caught_up is true.
     Sync {
         #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10000))]
@@ -97,7 +98,12 @@ enum Operation {
         #[arg(long, requires = "txid")]
         index: Option<u32>,
     },
-    /// Spend one sufficiently large Tachyon note, returning change to this wallet.
+    /// Combine multiple available notes into one fresh note owned by this wallet.
+    Consolidate {
+        #[arg(long, default_value_t = 16)]
+        max_inputs: usize,
+    },
+    /// Spend one or more Tachyon notes, returning change to this wallet.
     Send {
         #[arg(long)]
         to: String,
@@ -136,6 +142,11 @@ enum Operation {
         #[arg(long)]
         txid: String,
     },
+    /// List status for selected operation IDs without loading full history.
+    TransactionStatus {
+        #[arg(long = "id")]
+        ids: Vec<String>,
+    },
     /// List mined, pending, or expired transactions (receipts and keys are not printed).
     Transactions,
 }
@@ -172,6 +183,7 @@ impl Command {
                 matches!(
                     self.command,
                     Operation::Shield { .. }
+                        | Operation::Consolidate { .. }
                         | Operation::Send { .. }
                         | Operation::Unshield { .. }
                         | Operation::TransparentSend { .. }
@@ -246,15 +258,26 @@ impl Command {
             return Ok(result);
         }
         control.stage("Opening wallet database…")?;
-        let store = Store::open(&self.wallet_dir, false)?;
+        let read_only = matches!(
+            self.command,
+            Operation::BalanceSummary
+                | Operation::Transactions
+                | Operation::TransactionStatus { .. }
+        );
+        let store = if read_only {
+            Store::open_readonly(&self.wallet_dir)?
+        } else {
+            Store::open(&self.wallet_dir, false)?
+        };
         let config = store.config()?;
         let key = SpendingKey::from(config.seed);
         let result = match self.command {
             Operation::Init { .. } => unreachable!("init returned above"),
             Operation::Address => addresses(&config)?,
-            Operation::Balance => {
-                let blocks = store.blocks()?;
-                let states = note_states(&store, &config, &blocks, control)?;
+            operation @ (Operation::Balance | Operation::BalanceSummary) => {
+                let summary = matches!(operation, Operation::BalanceSummary);
+                let tip = store.tip()?;
+                let states = note_states(&store, &config, control, !summary)?;
                 let available = states
                     .iter()
                     .filter(|(_, s)| *s == "available")
@@ -262,26 +285,37 @@ impl Command {
                         total.checked_add(r.value_zat).context("balance overflow")
                     })?;
                 let snapshot = store.funding_snapshot()?;
-                let reserved = store
-                    .pending()?
-                    .into_iter()
-                    .filter(|p| pending_status(p, &blocks) != "expired")
-                    .map(|p| p.source)
-                    .collect();
+                let mut reserved = BTreeSet::new();
+                for pending in store.pending()? {
+                    if pending_status(&pending, &store)? != "expired" {
+                        reserved.insert(pending.source);
+                    }
+                }
                 let transparent = snapshot
                     .as_ref()
                     .map(|snapshot| {
                         ensure!(
-                            blocks.iter().any(|block| block.height == snapshot.height
-                                && block.hash == snapshot.hash),
+                            store
+                                .block(snapshot.height)?
+                                .is_some_and(|block| block.hash == snapshot.hash),
                             "transparent snapshot is no longer on the synced chain; run sync"
                         );
                         snapshot.balance(&reserved)
                     })
                     .transpose()?;
-                json!({"synced_height":blocks.last().map(|b| b.height), "available_zat":available,
-                    "transparent":transparent,
-                    "notes":states.into_iter().map(|(r,s)| Ok(json!({"id":r.id()?,"value_zat":r.value_zat,"status":s}))).collect::<Result<Vec<_>>>()?})
+                let mut result = json!({"synced_height":tip.map(|block| block.height), "available_zat":available,
+                    "transparent":transparent});
+                result["notes"] = json!(
+                    states
+                        .into_iter()
+                        .filter(|(_, status)| !summary || *status == "available")
+                        .map(|(r, s)| Ok(json!({"id":r.id()?,"value_zat":r.value_zat,"status":s})))
+                        .collect::<Result<Vec<_>>>()?
+                );
+                if summary {
+                    return Ok(result);
+                }
+                result
             }
             Operation::Sync {
                 max_blocks,
@@ -334,25 +368,39 @@ impl Command {
                 receipt.locator = if legacy {
                     None
                 } else {
-                    let blocks = store.blocks()?;
-                    let block = blocks
-                        .iter()
-                        .find(|block| block.transactions.contains(&txid));
+                    let block = store.block_by_txid(&txid)?;
                     Some(Locator {
                         txid: hex::encode(bytes32(&txid)?),
-                        height: block.map(|block| block.height),
-                        block_hash: block.map(|block| block.hash.clone()),
+                        height: block.as_ref().map(|block| block.height),
+                        block_hash: block.map(|block| block.hash),
                     })
                 };
                 write_private(&out, &serde_json::to_vec_pretty(&receipt)?)?;
                 json!({"txid":txid,"receipt":out})
             }
+            Operation::TransactionStatus { ids } => {
+                let mut transactions = Vec::new();
+                for id in ids {
+                    validate_operation_id(&id)?;
+                    if let Some(saved) = store.operation(&id)? {
+                        let pending = find_pending(&store, &saved.txid)?;
+                        transactions.push(json!({"txid":pending.txid,"operation_id":id,
+                            "expiry_height":pending.expiry,"status":pending_status(&pending,&store)?}));
+                    }
+                }
+                return Ok(json!({"transactions":transactions}));
+            }
             Operation::Transactions => {
-                let blocks = store.blocks()?;
                 let ids = store.operation_ids()?;
-                json!({"transactions":store.pending()?.into_iter().map(|p| {
-                    json!({"txid":p.txid,"operation_id":ids.get(&p.txid),"expiry_height":p.expiry,"status":pending_status(&p,&blocks)})
-                }).collect::<Vec<_>>()})
+                let transactions = store
+                    .pending()?
+                    .into_iter()
+                    .map(|pending| {
+                        Ok(json!({"txid":pending.txid,"operation_id":ids.get(&pending.txid),
+                            "expiry_height":pending.expiry,"status":pending_status(&pending,&store)?}))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(json!({"transactions":transactions}));
             }
             Operation::Lookup { id } => {
                 validate_operation_id(&id)?;
@@ -365,8 +413,7 @@ impl Command {
                     "run sync until caught up before submitting"
                 );
                 let pending = find_pending(&store, &txid)?;
-                let blocks = store.blocks()?;
-                let status = pending_status(&pending, &blocks);
+                let status = pending_status(&pending, &store)?;
                 ensure!(
                     status != "expired",
                     "transaction expired; create a new payment"
@@ -381,6 +428,7 @@ impl Command {
                 );
             }
             operation @ (Operation::Shield { .. }
+            | Operation::Consolidate { .. }
             | Operation::Send { .. }
             | Operation::Unshield { .. }
             | Operation::TransparentSend { .. }) => {
@@ -389,6 +437,7 @@ impl Command {
                     &config,
                     operation,
                     self.operation_id.as_deref(),
+                    self.expected_tip.as_deref(),
                     control,
                 );
             }
@@ -396,6 +445,95 @@ impl Command {
         control.stage("Committing wallet updates…")?;
         store.commit()?;
         Ok(result)
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct SyncManyCommand {
+    /// Wallet directories to advance against the same canonical block cache.
+    #[arg(long = "wallet-dir", required = true)]
+    wallet_dirs: Vec<PathBuf>,
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10000))]
+    max_blocks: u32,
+    /// Maximum concurrent wallet writers.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
+    workers: u32,
+    /// Suppress progress on stderr.
+    #[arg(long, short = 'q', global = true)]
+    quiet: bool,
+}
+
+impl SyncManyCommand {
+    pub async fn run_interruptible(self) -> Result<()> {
+        control::run(self.quiet, move |control| self.run_with_control(&control)).await
+    }
+
+    fn run_with_control(&self, control: &Control) -> Result<()> {
+        let result = self.execute_with_control(control)?;
+        println!("{}", serde_json::to_string(&result)?);
+        Ok(())
+    }
+
+    fn execute_with_control(&self, control: &Control) -> Result<Value> {
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(sync::SyncCache::default()));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let wallets = std::sync::Mutex::new(serde_json::Map::new());
+        let errors = std::sync::Mutex::new(Vec::new());
+        let mut names = std::collections::BTreeSet::new();
+        for dir in &self.wallet_dirs {
+            let name = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("wallet directory has no UTF-8 name")?;
+            ensure!(names.insert(name), "duplicate wallet name: {name}");
+        }
+        std::thread::scope(|scope| {
+            for _ in 0..(self.workers as usize).min(self.wallet_dirs.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(dir) = self.wallet_dirs.get(index) else {
+                            break;
+                        };
+                        let result = (|| -> Result<(String, Value)> {
+                            let name = dir
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .context("wallet directory has no UTF-8 name")?
+                                .to_string();
+                            let store = Store::open(dir, false)?;
+                            let config = store.config()?;
+                            let result = sync::sync_with_cache(
+                                &store,
+                                &config,
+                                self.max_blocks,
+                                None,
+                                control,
+                                &cache,
+                            )?;
+                            store.commit()?;
+                            Ok((name, result))
+                        })();
+                        match result {
+                            Ok((name, result)) => {
+                                wallets.lock().unwrap().insert(name, result);
+                            }
+                            Err(error) => errors.lock().unwrap().push(error),
+                        }
+                    }
+                });
+            }
+        });
+        let mut errors = errors.into_inner().unwrap();
+        if let Some(error) = errors.drain(..).next() {
+            return Err(error);
+        }
+        Ok(json!({"wallets":wallets.into_inner().unwrap()}))
+    }
+
+    #[cfg(test)]
+    fn execute(self) -> Result<Value> {
+        self.execute_with_control(&Control::new(true))
     }
 }
 
@@ -409,17 +547,17 @@ fn addresses(config: &Config) -> Result<Value> {
     )
 }
 
-fn pending_status(pending: &Pending, blocks: &[Block]) -> &'static str {
-    if blocks
-        .iter()
-        .any(|b| b.transactions.contains(&pending.txid))
-    {
+fn pending_status(pending: &Pending, store: &Store) -> Result<&'static str> {
+    Ok(if store.has_transaction(&pending.txid)? {
         "mined"
-    } else if blocks.last().is_some_and(|b| b.height > pending.expiry) {
+    } else if store
+        .tip()?
+        .is_some_and(|block| block.height > pending.expiry)
+    {
         "expired"
     } else {
         "pending"
-    }
+    })
 }
 
 fn find_pending(store: &Store, txid: &str) -> Result<Pending> {
@@ -430,30 +568,70 @@ fn find_pending(store: &Store, txid: &str) -> Result<Pending> {
         .context("unknown wallet transaction")
 }
 
+pub(crate) fn refresh_note_nullifiers(
+    store: &Store,
+    config: &Config,
+    current_epoch: u32,
+) -> Result<()> {
+    let key = SpendingKey::from(config.seed);
+    for receipt in store.notes_without_nullifier(current_epoch)? {
+        receipt.check_owner(&key, &config.network_id)?;
+        let id = receipt.id()?;
+        let Some(creation) = store.tachygram_height(&id)? else {
+            continue;
+        };
+        let note = receipt.note()?;
+        let master = key.derive_nullifier_private().derive_note_private(note.psi);
+        let existing = store.note_nullifier_epochs(&id)?;
+        let first_epoch = (creation - config.activation) / EPOCH_SIZE;
+        for epoch in first_epoch..=current_epoch {
+            if existing.contains(&epoch) {
+                continue;
+            }
+            let nullifier =
+                hex::encode(Fp::from(master.derive_nullifier(EpochIndex::new(epoch))).to_bytes());
+            let spent_height = store.tachygram_height(&nullifier)?;
+            store.put_note_nullifier(&id, epoch, &nullifier, spent_height)?;
+            if spent_height.is_some() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn note_states(
     store: &Store,
     config: &Config,
-    blocks: &[Block],
     control: &Control,
+    allow_refresh: bool,
 ) -> Result<Vec<(Receipt, &'static str)>> {
     control.stage("Checking note states…")?;
     let key = SpendingKey::from(config.seed);
-    let reserved: BTreeSet<_> = store
-        .pending()?
-        .into_iter()
-        .filter(|p| pending_status(p, blocks) != "expired")
-        .map(|p| p.source)
-        .collect();
-    let mut epoch_members: BTreeMap<u32, BTreeSet<&str>> = BTreeMap::new();
-    for block in blocks {
-        control.check()?;
-        let members = epoch_members.entry(block.epoch).or_default();
-        members.extend(
-            block
-                .stamps
-                .iter()
-                .flat_map(|s| s.tachygrams.iter().map(String::as_str)),
+    let current_epoch = store.tip()?.map(|block| block.epoch).unwrap_or(0);
+    if allow_refresh {
+        refresh_note_nullifiers(store, config, current_epoch)?;
+    } else {
+        ensure!(
+            store
+                .confirmed_notes_without_nullifier(current_epoch)?
+                .is_empty(),
+            "run sync to update note spend state"
         );
+    }
+    let spent = store.spent_note_ids()?;
+    let mined = store.mined_note_ids()?;
+    let mut reserved = BTreeSet::new();
+    for pending in store.pending()? {
+        if pending_status(&pending, store)? != "expired" {
+            if let Some(ids) = pending.source.strip_prefix("notes:") {
+                for id in ids.split(',') {
+                    reserved.insert(format!("note:{id}"));
+                }
+            } else {
+                reserved.insert(pending.source);
+            }
+        }
     }
     store
         .notes()?
@@ -462,20 +640,9 @@ fn note_states(
             control.check()?;
             receipt.check_owner(&key, &config.network_id)?;
             let id = receipt.id()?;
-            let note = receipt.note()?;
-            let master = key.derive_nullifier_private().derive_note_private(note.psi);
-            let mined = epoch_members
-                .values()
-                .any(|members| members.contains(id.as_str()));
-            let spent = epoch_members.iter().any(|(epoch, members)| {
-                let nf = hex::encode(
-                    Fp::from(master.derive_nullifier(EpochIndex::new(*epoch))).to_repr(),
-                );
-                members.contains(nf.as_str())
-            });
-            let status = if spent {
+            let status = if spent.contains(&id) {
                 "spent"
-            } else if !mined {
+            } else if !mined.contains(&id) {
                 "unconfirmed"
             } else if reserved.contains(&format!("note:{id}")) {
                 "reserved"
@@ -501,10 +668,9 @@ fn validate_operation_id(id: &str) -> Result<()> {
 
 fn operation_result(store: &Store, saved: &StoredOperation) -> Result<Value> {
     let pending = find_pending(store, &saved.txid)?;
-    let blocks = store.blocks()?;
     Ok(
         json!({"operation_id":saved.id,"txid":saved.txid,"request":saved.request,
-        "status":pending_status(&pending,&blocks),"synced_height":blocks.last().map(|b| b.height),
+        "status":pending_status(&pending,store)?,"synced_height":store.tip()?.map(|block| block.height),
         "expiry_height":pending.expiry,"fee_zat":FEE,"has_receipt":pending.receipt.is_some()}),
     )
 }
@@ -528,6 +694,13 @@ fn payment_request(operation: &Operation) -> Result<Value> {
                 bytes32(txid)?;
             }
             json!({"kind":"shield","amount_zat":amount_zat,"txid":txid.as_ref().map(|id| id.to_ascii_lowercase()),"index":index})
+        }
+        Operation::Consolidate { max_inputs } => {
+            ensure!(
+                (2..=64).contains(max_inputs),
+                "max-inputs must be between 2 and 64"
+            );
+            json!({"kind":"consolidate","max_inputs":max_inputs})
         }
         Operation::Send { to, amount_zat } => {
             note::decode_address(to)?;
@@ -561,6 +734,7 @@ fn pay(
     config: &Config,
     operation: Operation,
     operation_id: Option<&str>,
+    expected_tip: Option<&str>,
     control: &Control,
 ) -> Result<Value> {
     let request = payment_request(&operation)?;
@@ -577,12 +751,27 @@ fn pay(
         store.commit()?;
         return Ok(result); // Offline: never reselect inputs, rebuild proofs, or rebroadcast.
     }
-    ensure!(
-        sync(store, config, 1000, None, control)?["caught_up"] == true,
-        "run sync until caught up before creating transactions"
-    );
-    let blocks = store.blocks()?;
-    let tip = blocks.last().context("wallet has not synced")?;
+    let tip = if let Some(expected) = expected_tip {
+        bytes32(expected)?;
+        let tip = store.tip()?.context("wallet has not synced")?;
+        ensure!(
+            tip.hash.eq_ignore_ascii_case(expected),
+            "wallet tip {} does not match expected tip {expected}",
+            tip.hash
+        );
+        let rpc = rpc(config, control)?;
+        ensure!(
+            rpc.height()? == tip.height && rpc.hash(tip.height)? == tip.hash,
+            "chain changed since expected tip; sync and retry"
+        );
+        tip
+    } else {
+        ensure!(
+            sync(store, config, 1000, None, control)?["caught_up"] == true,
+            "run sync until caught up before creating transactions"
+        );
+        store.tip()?.context("wallet has not synced")?
+    };
     let epoch_end = config
         .activation
         .checked_add(
@@ -605,7 +794,7 @@ fn pay(
     };
     let own_address = note::address(&SpendingKey::from(config.seed));
     let mut outputs = Vec::new();
-    let mut spend = None;
+    let mut spends = Vec::new();
     let mut funding = None;
     let mut transparent_output = None;
     let mut recipient = None;
@@ -621,7 +810,6 @@ fn pay(
                 (Some(txid), Some(index)) => (hex::encode(bytes32(&txid)?), index),
                 (None, None) => select_funding_outpoint(
                     store,
-                    &blocks,
                     &rpc,
                     amount_zat
                         .context("automatic selection requires an amount")?
@@ -632,13 +820,12 @@ fn pay(
                 _ => anyhow::bail!("--txid and --index must be provided together"),
             };
             source = format!("outpoint:{txid}:{index}");
-            ensure!(
-                !store
-                    .pending()?
-                    .iter()
-                    .any(|p| p.source == source && pending_status(p, &blocks) != "expired"),
-                "funding output is already reserved"
-            );
+            for pending in store.pending()? {
+                ensure!(
+                    pending.source != source || pending_status(&pending, store)? == "expired",
+                    "funding output is already reserved"
+                );
+            }
             let (selected, coinbase) = load_funding(&rpc, config.seed, &txid, index)?;
             let after_fee = selected
                 .output
@@ -655,7 +842,7 @@ fn pay(
                 !coinbase || change == 0,
                 "coinbase outputs must be shielded in full minus the fee; omit the amount with --txid/--index, or use a non-coinbase UTXO"
             );
-            if change > 0 {
+            if let Some(change) = transaction::non_dust_change(change) {
                 transparent_output = Some((transaction::funding_address(config.seed)?, change));
             }
             outputs.push(Receipt::new(&config.network_id, &own_address, amount)?);
@@ -665,13 +852,8 @@ fn pay(
             let needed = amount_zat
                 .checked_add(FEE)
                 .context("amount plus fee overflow")?;
-            let (txid, index) = select_funding_outpoint(
-                store,
-                &blocks,
-                &rpc,
-                needed,
-                FundingPurpose::TransparentSend,
-            )?;
+            let (txid, index) =
+                select_funding_outpoint(store, &rpc, needed, FundingPurpose::TransparentSend)?;
             source = format!("outpoint:{txid}:{index}");
             let (selected, coinbase) = load_funding(&rpc, config.seed, &txid, index)?;
             ensure!(
@@ -681,12 +863,72 @@ fn pay(
             funding = Some(selected);
             transparent_output = Some((to, amount_zat));
         }
+        Operation::Consolidate { max_inputs } => {
+            let mut selected: Vec<_> = note_states(store, config, control, true)?
+                .into_iter()
+                .filter(|(_, status)| *status == "available")
+                .map(|(receipt, _)| receipt)
+                .collect();
+            selected.sort_by_key(|receipt| receipt.value_zat);
+            selected.truncate(max_inputs);
+            ensure!(
+                selected.len() >= 2,
+                "need at least two available notes to consolidate"
+            );
+            let total = selected.iter().try_fold(0u64, |sum, receipt| {
+                sum.checked_add(receipt.value_zat)
+                    .context("note total overflow")
+            })?;
+            let amount = total
+                .checked_sub(FEE)
+                .context("notes cannot pay the consolidation fee")?;
+            ensure!(amount > 0, "consolidated note must be positive");
+            let ids = selected
+                .iter()
+                .map(|receipt| receipt.id())
+                .collect::<Result<Vec<_>>>()?;
+            source = format!("notes:{}", ids.join(","));
+            outputs.push(Receipt::new(&config.network_id, &own_address, amount)?);
+            spends = selected;
+        }
         Operation::Send { to, amount_zat } | Operation::Unshield { to, amount_zat } => {
             ensure!(amount_zat > 0, "amount must be positive");
             let needed = amount_zat.checked_add(FEE).context("amount overflow")?;
-            let selected = note_states(store, config, &blocks, control)?.into_iter().filter(|(r,s)| *s == "available" && r.value_zat >= needed)
-                .min_by_key(|(r,_)| r.value_zat).map(|(r,_)| r).context("no single available note covers amount plus fee; this wallet does not consolidate notes")?;
-            source = format!("note:{}", selected.id()?);
+            let mut available: Vec<_> = note_states(store, config, control, true)?
+                .into_iter()
+                .filter(|(_, status)| *status == "available")
+                .map(|(receipt, _)| receipt)
+                .collect();
+            available.sort_by_key(|receipt| receipt.value_zat);
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            if let Some(single) = available.iter().find(|receipt| receipt.value_zat >= needed) {
+                total = single.value_zat;
+                selected.push(single.clone());
+            } else {
+                for receipt in available.into_iter().take(64) {
+                    total = total
+                        .checked_add(receipt.value_zat)
+                        .context("note total overflow")?;
+                    selected.push(receipt);
+                    if total >= needed {
+                        break;
+                    }
+                }
+            }
+            ensure!(
+                total >= needed,
+                "available notes do not cover amount plus fee"
+            );
+            let ids = selected
+                .iter()
+                .map(|receipt| receipt.id())
+                .collect::<Result<Vec<_>>>()?;
+            source = if ids.len() == 1 {
+                format!("note:{}", ids[0])
+            } else {
+                format!("notes:{}", ids.join(","))
+            };
             // The command-specific address format was checked before accessing the node.
             if to.starts_with("tachyon-test:") {
                 let receipt = Receipt::new(&config.network_id, &to, amount_zat)?;
@@ -696,11 +938,11 @@ fn pay(
                 transaction::transparent_script(&to)?;
                 transparent_output = Some((to, amount_zat));
             }
-            let change = selected.value_zat - needed;
+            let change = total - needed;
             if change > 0 {
                 outputs.push(Receipt::new(&config.network_id, &own_address, change)?);
             }
-            spend = Some(selected);
+            spends = selected;
         }
         _ => anyhow::bail!("not a payment operation"),
     }
@@ -718,8 +960,8 @@ fn pay(
         transaction::build(
             Payment {
                 seed: config.seed,
-                blocks: &blocks,
-                spend: spend.as_ref(),
+                blocks: store.into(),
+                spends: spends.iter().collect(),
                 funding,
                 outputs: &outputs,
                 transparent_output,
@@ -825,7 +1067,6 @@ fn load_funding(rpc: &Rpc, seed: [u8; 32], txid: &str, index: u32) -> Result<(Fu
 
 fn select_funding_outpoint(
     store: &Store,
-    blocks: &[Block],
     rpc: &Rpc,
     needed: u64,
     purpose: FundingPurpose,
@@ -833,23 +1074,14 @@ fn select_funding_outpoint(
     let snapshot = store
         .funding_snapshot()?
         .context("run sync until caught up before selecting funding")?;
-    let reserved = store
-        .pending()?
-        .into_iter()
-        .filter(|pending| pending_status(pending, blocks) != "expired")
-        .map(|pending| pending.source)
-        .collect();
-    // Avoid an RPC per mining reward when all of them would require forbidden transparent change.
-    let coinbases: BTreeSet<_> = blocks
-        .iter()
-        .filter_map(|block| block.transactions.first())
-        .map(String::as_str)
-        .collect();
+    let mut reserved = BTreeSet::new();
+    for pending in store.pending()? {
+        if pending_status(&pending, store)? != "expired" {
+            reserved.insert(pending.source);
+        }
+    }
     for (txid, index, value) in snapshot.candidates(needed, &reserved) {
         let allow_coinbase = matches!(purpose, FundingPurpose::Shield) && value == needed;
-        if !allow_coinbase && coinbases.contains(txid) {
-            continue;
-        }
         let available: Value = rpc.call("gettxout", json!([txid, index, true]))?;
         if available.is_null() {
             continue; // Spent in the mempool, or since the captured UTXO snapshot.
