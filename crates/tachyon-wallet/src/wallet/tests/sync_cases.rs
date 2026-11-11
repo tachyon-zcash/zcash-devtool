@@ -42,6 +42,105 @@ fn downloaded(node: &Node) -> Vec<u32> {
 }
 
 #[test]
+fn network_identity_check_reuses_canonical_tip() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    init_wallet(&node, &dir)?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    node.data.lock().unwrap().requests.clear();
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 1000,
+            from_height: None,
+        },
+    )?;
+    let hashes: Vec<u64> = node
+        .data
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(method, _)| method == "getblockhash")
+        .map(|(_, params)| params[0].as_u64().unwrap())
+        .collect();
+    assert!(!hashes.contains(&0));
+    assert_eq!(hashes.iter().filter(|height| **height == 8).count(), 2);
+    Ok(())
+}
+
+#[test]
+fn sync_many_command_returns_each_wallet_result() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let alice = temp.path().join("alice");
+    let bob = temp.path().join("bob");
+    init_wallet(&node, &alice)?;
+    init_wallet(&node, &bob)?;
+    advance(&node, 9)?;
+    node.data.lock().unwrap().requests.clear();
+    let result = crate::wallet::SyncManyCommand {
+        wallet_dirs: vec![alice, bob],
+        max_blocks: 1000,
+        workers: 2,
+        quiet: true,
+    }
+    .execute()?;
+    assert_eq!(result["wallets"]["alice"]["height"], 9);
+    assert_eq!(result["wallets"]["bob"]["height"], 9);
+    let fetches = node
+        .data
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(method, _)| method == "gettachyonblock")
+        .count();
+    assert_eq!(fetches, 1);
+    Ok(())
+}
+
+#[test]
+fn sync_many_shares_block_fetch_and_validation() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let alice = temp.path().join("alice");
+    let bob = temp.path().join("bob");
+    init_wallet(&node, &alice)?;
+    init_wallet(&node, &bob)?;
+    advance(&node, 9)?;
+    node.data.lock().unwrap().requests.clear();
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::wallet::sync::SyncCache::default(),
+    ));
+    let control = Control::new(true);
+    for dir in [&alice, &bob] {
+        let store = Store::open(dir, false)?;
+        let config = store.config()?;
+        crate::wallet::sync::sync_with_cache(&store, &config, 1000, None, &control, &cache)?;
+        store.commit()?;
+    }
+    assert_eq!(cache.lock().unwrap().stats(), (1, 1));
+    let fetches = node
+        .data
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(method, _)| method == "gettachyonblock")
+        .count();
+    assert_eq!(fetches, 1);
+    Ok(())
+}
+
+#[test]
 fn new_wallet_only_downloads_current_epoch_even_when_old_payloads_are_pruned() -> Result<()> {
     let node = Node::start()?;
     let start = 8 + 2 * EPOCH_SIZE;
@@ -220,8 +319,8 @@ fn old_receipt_backfills_its_epoch_resumes_a_gap_and_reuses_cached_suffix() -> R
     let sent = transaction::build(
         Payment {
             seed: SEED,
-            blocks: &blocks,
-            spend: Some(&receipt),
+            blocks: (&blocks).into(),
+            spends: vec![&receipt],
             funding: None,
             outputs: &[Receipt::new(
                 &receipt.network_id,
@@ -317,6 +416,7 @@ fn missing_history_and_cancelled_backfill_preserve_wallet_and_checkpoint() -> Re
             wallet_dir: dir.clone(),
             quiet: true,
             operation_id: None,
+            expected_tip: None,
             command: operation()
         }
         .execute_with_control(&control)

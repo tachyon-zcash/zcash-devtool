@@ -18,15 +18,11 @@ use transparent::{
     sighash::{SighashType, TransparentAuthorizingContext},
 };
 use zcash_tachyon::{
-    TachyonBundle, action, bundle::Plan, entropy::ActionEntropy, keys::private::SpendingKey, value,
+    Note, TachyonBundle, action, bundle::Plan, entropy::ActionEntropy, fee,
+    keys::private::SpendingKey, note::CommitmentTrapdoor, nullifier, value,
 };
 
-use crate::{
-    chain::{Block, anchor},
-    control::Control,
-    note::Receipt,
-    proofs,
-};
+use crate::{chain::anchor, control::Control, note::Receipt, proofs, store::ChainData};
 
 pub const FEE: u64 = 50_000;
 
@@ -84,8 +80,8 @@ pub struct Funding {
 
 pub struct Payment<'a> {
     pub seed: [u8; 32],
-    pub blocks: &'a [Block],
-    pub spend: Option<&'a Receipt>,
+    pub blocks: ChainData<'a>,
+    pub spends: Vec<&'a Receipt>,
     pub funding: Option<Funding>,
     pub outputs: &'a [Receipt],
     /// An unshielded payment, or transparent change from shielding a non-coinbase UTXO.
@@ -98,45 +94,72 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
     let Payment {
         seed,
         blocks,
-        spend,
+        spends,
         funding,
         outputs,
         transparent_output,
         expiry,
     } = payment;
-    let tip = blocks.last().context("wallet has not synced")?;
+    let tip = blocks.tip()?;
     ensure!(
-        spend.is_some() != funding.is_some(),
+        spends.is_empty() != funding.is_none(),
         "exactly one funding source is required"
     );
-    let incoming = spend
-        .map(|r| r.value_zat)
-        .or_else(|| funding.as_ref().map(|f| f.output.value().into_u64()))
-        .unwrap_or(0);
+    let incoming = spends.iter().try_fold(0u64, |total, receipt| {
+        total
+            .checked_add(receipt.value_zat)
+            .context("amount overflow")
+    })?;
+    let incoming = if spends.is_empty() {
+        funding
+            .as_ref()
+            .map(|f| f.output.value().into_u64())
+            .unwrap_or(0)
+    } else {
+        incoming
+    };
     let outgoing = outputs.iter().try_fold(
         transparent_output.as_ref().map_or(0, |(_, n)| *n),
         |total, r| total.checked_add(r.value_zat).context("amount overflow"),
     )?;
+    let fee = incoming
+        .checked_sub(outgoing)
+        .context("transaction outputs exceed its inputs")?;
     ensure!(
-        incoming.checked_sub(outgoing) == Some(FEE),
-        "transaction must pay the configured fee"
+        (FEE..FEE + 54).contains(&fee),
+        "transaction must pay the configured fee plus at most dust change"
     );
     let key = SpendingKey::from(seed);
     let mut rng = rand::rng();
     let mut evidence = Vec::new();
     let mut plan_anchor = anchor(&tip.anchor_after)?;
-    let mut spends = Vec::new();
-    if let Some(receipt) = spend {
+    let multiple_spends = spends.len() > 1;
+    let mut prepared = Vec::with_capacity(spends.len());
+    for receipt in spends {
         let note = receipt.note()?;
-        let spendable = proofs::spendable(blocks, &key, note, control)?;
-        plan_anchor = spendable.data().2;
+        let spendable = proofs::spendable(&blocks, &key, note, control)?;
+        let secret = proofs::secret(&key, note, control)?;
+        prepared.push((note, secret, spendable));
+    }
+    if prepared.len() == 1 {
+        plan_anchor = prepared[0].2.data().2;
+    } else if multiple_spends {
+        plan_anchor = anchor(&tip.anchor_after)?;
+    }
+    let mut spends = Vec::with_capacity(prepared.len());
+    for (note, secret, spendable) in prepared {
+        let spans = if multiple_spends {
+            proofs::anchor_spans(&blocks, spendable.data().2, plan_anchor, control)?
+        } else {
+            Vec::new()
+        };
         spends.push(action::Plan::spend(
             note,
             ActionEntropy::random(&mut rng),
             value::Trapdoor::random(&mut rng),
             |alpha| key.derive_proof_private().ak.derive_action_public(&alpha),
         ));
-        evidence.push((proofs::secret(&key, note, control)?, spendable));
+        evidence.push((secret, spendable, spans));
     }
     let outputs = outputs
         .iter()
@@ -148,20 +171,45 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let plan = Plan::new(spends, outputs);
+    let max_fee_note = Note {
+        pk: key.derive_payment_key(),
+        value: value::Positive::try_from(FEE)?,
+        psi: nullifier::Trapdoor::random(&mut rng),
+        rcm: CommitmentTrapdoor::random(&mut rng),
+    };
+    let plan = Plan::new(spends, outputs, max_fee_note);
     control.stage("Proving transaction stamp…")?;
-    let stamp = plan.clone().stamp_plan(plan_anchor).prove(
-        &mut rng,
-        &key.derive_proof_private(),
-        evidence,
+    let stamp = plan
+        .clone()
+        .stamp_plan(plan_anchor, value::Positive::try_from(FEE)?)
+        .prove(&mut rng, &key.derive_proof_private(), evidence)?;
+    let fee_descriptors = std::collections::BTreeSet::from([fee::Descriptor {
+        cv_feemax: max_fee_note.cv_feemax(),
+        v_fee: value::Positive::try_from(FEE)?,
+    }]);
+    let stamp = proofs::lift_stamp(
+        &blocks,
+        stamp,
+        &plan.descriptors(),
+        &fee_descriptors,
+        control,
     )?;
-    let stamp = proofs::lift_stamp(blocks, stamp, &plan.descriptors(), control)?;
     control.stage("Signing transaction…")?;
-    let placeholder = TachyonBundle::Proven(
-        plan.clone()
+    let placeholder = TachyonBundle::Proven({
+        let bundle = plan
+            .clone()
             .sign(&mut rng, &[0; 32], &key.derive_auth_private())?
-            .stamp(stamp.clone()),
-    );
+            .stamp(stamp.clone());
+        let stamp = bundle.stamp.compress(&mut rng)?;
+        zcash_tachyon::Bundle {
+            actions: bundle.actions,
+            value_balance: bundle.value_balance,
+            cv_feemax: bundle.cv_feemax,
+            binding_sig: bundle.binding_sig,
+            memo: bundle.memo,
+            stamp,
+        }
+    });
     let vout = transparent_output
         .map(|(address, amount)| -> Result<_> {
             Ok(TxOut::new(
@@ -173,11 +221,25 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
         .into_iter()
         .collect();
     authorize(seed, funding, vout, expiry, placeholder, |hash| {
-        Ok(TachyonBundle::Proven(
-            plan.sign(&mut rng, hash, &key.derive_auth_private())?
-                .stamp(stamp),
-        ))
+        let bundle = plan
+            .sign(&mut rng, hash, &key.derive_auth_private())?
+            .stamp(stamp);
+        let stamp = bundle.stamp.compress(&mut rng)?;
+        Ok(TachyonBundle::Proven(zcash_tachyon::Bundle {
+            actions: bundle.actions,
+            value_balance: bundle.value_balance,
+            cv_feemax: bundle.cv_feemax,
+            binding_sig: bundle.binding_sig,
+            memo: bundle.memo,
+            stamp,
+        }))
     })
+}
+
+pub(crate) fn non_dust_change(change: u64) -> Option<u64> {
+    // P2PKH outputs are 34 serialized bytes; Zakura's threshold is
+    // 3 * (100 * (34 + 148) / 1000) = 54 zatoshis.
+    (change >= 54).then_some(change)
 }
 
 /// Create a V7 payment with no Tachyon bundle or proofs, using the wallet's funding key.
@@ -202,7 +264,7 @@ pub fn build_transparent(
         Zatoshis::from_u64(amount)?,
         transparent_script(to)?,
     )];
-    if change > 0 {
+    if let Some(change) = non_dust_change(change) {
         vout.push(TxOut::new(
             Zatoshis::from_u64(change)?,
             transparent_script(&funding_address(seed)?)?,

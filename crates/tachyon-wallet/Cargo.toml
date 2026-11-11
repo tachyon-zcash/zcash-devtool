@@ -14,6 +14,7 @@ ff = "0.14"
 hex = "0.4"
 pasta_curves = { package = "zakura-pasta-curves", version = "1.0.1" }
 rand = { version = "0.10", features = ["std_rng"] }
+udon = { package = "zakura-udon", version = "0.1.0", features = ["traits"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -24,12 +25,17 @@ serde_json = "1"
 sha2 = "0.10"
 ripemd = "0.1"
 zcash_script = "0.4.3"
-ragu = { git = "https://github.com/tachyon-zcash/ragu", rev = "0881656dc3d9f47d3d9eaaf692b15dd8938d9bf9", features = ["mock"] }
-ragu_circuits = { git = "https://github.com/tachyon-zcash/ragu", rev = "0881656dc3d9f47d3d9eaaf692b15dd8938d9bf9" }
-zcash_tachyon = { git = "https://github.com/tachyon-zcash/tachyon", rev = "a4abfbddb7dd4ac1db67df7cc19d57d0d965d3e7" }
-primitives = { package = "zakura-primitives", git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7", default-features = false, features = ["std"] }
-protocol = { package = "zakura-protocol", git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7" }
-transparent = { package = "zakura-transparent", git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7" }
+# TEMPORARY: tachyon fork pinned to upstream ragu main, including the proof
+# wire decoder used by cached epoch and spendability proofs.
+zcash_tachyon = { git = "https://github.com/cnode-agent/tachyon", rev = "088f4e1df789fc507742a9a08d27a07604c6a247" }
+# Ragu is pinned to upstream main; the mock driver (#929) and wire (#949)
+# changes are both merged there.
+ragu = { git = "https://github.com/tachyon-zcash/ragu", rev = "839cf50d1ff31c1d8b89c1f90f808f76422cec17", features = ["mock"] }
+ragu_circuits = { git = "https://github.com/tachyon-zcash/ragu", rev = "839cf50d1ff31c1d8b89c1f90f808f76422cec17" }
+ragu_core = { git = "https://github.com/tachyon-zcash/ragu", rev = "839cf50d1ff31c1d8b89c1f90f808f76422cec17", package = "ragu_core", default-features = false }
+primitives = { package = "zakura-primitives", git = "https://github.com/cnode-agent/common.git", rev = "b20577b61e92d9b081790e7eb8f54bbc20047f97", default-features = false, features = ["std"] }
+protocol = { package = "zakura-protocol", git = "https://github.com/cnode-agent/common.git", rev = "b20577b61e92d9b081790e7eb8f54bbc20047f97" }
+transparent = { package = "zakura-transparent", git = "https://github.com/cnode-agent/common.git", rev = "b20577b61e92d9b081790e7eb8f54bbc20047f97" }
 
 [dev-dependencies]
 tempfile = "3"
